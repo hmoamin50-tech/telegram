@@ -1,12 +1,13 @@
 {
-  "name": "telegram-hello-bot",
-  "version": "1.0.0",
-  "main": "index.js",
-  "scripts": {
-    "start": "node index.js"
-  },
-  "dependencies": {
-    "telegraf": "^4.16.3",
-    "express": "^4.19.2"
-  }
+"name": "kassala-engineering-library-bot",
+"version": "1.0.0",
+"description": "Electronic library for Kassala University Faculty of Engineering",
+"main": "index.js",
+"scripts": {
+"start": "node index.js"
+},
+"dependencies": {
+"telegraf": "^4.16.3",
+"express": "^4.19.2"
+}
 }

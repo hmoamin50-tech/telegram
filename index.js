@@ -1,7 +1,7 @@
 const { Telegraf, Markup } = require('telegraf');
 const express = require('express');
-const fs = require('fs');
-const path = require('path');
+const { Pool } = require('pg');
+require('dotenv').config();
 
 // =====================================
 // إعداد خادم HTTP
@@ -11,11 +11,35 @@ const app = express();
 const port = process.env.PORT || 3000;
 
 app.get('/', (req, res) => {
-    res.send('مكتبة كلية الهندسة - جامعة كسلا تعمل بنجاح');
+    res.send('بوت NOQAT للتوثيق وإهداء النقاط يعمل بنجاح');
 });
 
 app.listen(port, () => {
     console.log('HTTP server running on port ' + port);
+});
+
+// =====================================
+// إعداد قاعدة البيانات
+// =====================================
+
+if (!process.env.DATABASE_URL) {
+    console.error('خطأ: DATABASE_URL غير موجود في إعدادات البيئة');
+    process.exit(1);
+}
+
+const pool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    ssl: process.env.DB_SSL === 'true' ||
+         (process.env.DATABASE_URL || '').includes('supabase')
+        ? { rejectUnauthorized: false }
+        : false,
+    max: 5,
+    idleTimeoutMillis: 30000,
+    connectionTimeoutMillis: 15000
+});
+
+pool.on('error', (err) => {
+    console.error('خطأ غير متوقع في قاعدة البيانات:', err.message);
 });
 
 // =====================================
@@ -29,70 +53,28 @@ if (!process.env.BOT_TOKEN) {
 
 const bot = new Telegraf(process.env.BOT_TOKEN);
 
-const DATA_FILE = path.join(__dirname, 'data', 'library.json');
+const ADMIN_CHAT_ID = String(process.env.ADMIN_CHAT_ID || '');
 
-// تخزين حالة المستخدمين أثناء التنقل
+// حالة المستخدمين
 const userState = new Map();
 
 // =====================================
-// التخصصات
+// أدوات مساعدة
 // =====================================
 
-const specialties = {
-    mechanical: 'ميكانيكا',
-    civil: 'مدنية',
-    electrical: 'كهرباء',
-    power: 'كهرباء - قدرة',
-    communications: 'كهرباء - اتصالات'
-};
-
-// =====================================
-// قراءة قاعدة البيانات
-// =====================================
-
-function loadLibrary() {
-    try {
-        if (!fs.existsSync(DATA_FILE)) {
-            return {
-                mechanical: {},
-                civil: {},
-                electrical: {},
-                power: {},
-                communications: {}
-            };
-        }
-
-        return JSON.parse(
-            fs.readFileSync(DATA_FILE, 'utf8')
-        );
-    } catch (error) {
-        console.error('خطأ في قراءة قاعدة البيانات:', error.message);
-        return {};
-    }
+function isAdmin(ctx) {
+    return String(ctx.from.id) === ADMIN_CHAT_ID;
 }
 
-function saveLibrary(data) {
-    try {
-        fs.mkdirSync(path.dirname(DATA_FILE), {
-            recursive: true
-        });
-
-        fs.writeFileSync(
-            DATA_FILE,
-            JSON.stringify(data, null, 2),
-            'utf8'
-        );
-
-        return true;
-    } catch (error) {
-        console.error('خطأ في حفظ قاعدة البيانات:', error.message);
-        return false;
-    }
+function formatDate(dateStr) {
+    if (!dateStr) return '—';
+    const d = new Date(dateStr);
+    return d.toISOString().split('T')[0];
 }
 
-// =====================================
-// إدارة حالة المستخدم
-// =====================================
+function formatNumber(n) {
+    return new Intl.NumberFormat('en-US').format(Number(n) || 0);
+}
 
 function getState(ctx) {
     return userState.get(ctx.from.id) || {};
@@ -100,61 +82,11 @@ function getState(ctx) {
 
 function setState(ctx, values) {
     const oldState = getState(ctx);
-
-    userState.set(ctx.from.id, {
-        ...oldState,
-        ...values
-    });
+    userState.set(ctx.from.id, { ...oldState, ...values });
 }
 
 function resetState(ctx) {
-    userState.set(ctx.from.id, {
-        step: 'main'
-    });
-}
-
-// =====================================
-// القوائم العامة
-// =====================================
-
-function mainKeyboard() {
-    return Markup.inlineKeyboard([
-        [
-            Markup.button.callback(
-                '📚 المحتوى الأكاديمي',
-                'academic'
-            )
-        ],
-        [
-            Markup.button.callback(
-                'ℹ️ معلومات المكتبة',
-                'library_info'
-            )
-        ],
-        [
-            Markup.button.callback(
-                '🔍 البحث عن مقرر',
-                'search_course'
-            )
-        ],
-        [
-            Markup.button.callback(
-                '📩 التواصل مع الإدارة',
-                'contact'
-            )
-        ]
-    ]);
-}
-
-function homeKeyboard() {
-    return Markup.inlineKeyboard([
-        [
-            Markup.button.callback(
-                '🏠 القائمة الرئيسية',
-                'main'
-            )
-        ]
-    ]);
+    userState.set(ctx.from.id, { step: 'main' });
 }
 
 async function safeEdit(ctx, text, keyboard) {
@@ -167,886 +99,455 @@ async function safeEdit(ctx, text, keyboard) {
         ) {
             return;
         }
-
         await ctx.reply(text, keyboard);
     }
 }
 
 // =====================================
-// القائمة الرئيسية
+// القوائم
 // =====================================
+
+function mainKeyboard() {
+    return Markup.inlineKeyboard([
+        [Markup.button.callback('📋 طلبات التوثيق المعلقة', 'pending_docs')],
+        [Markup.button.callback('📊 الإحصائيات', 'stats')],
+        [Markup.button.callback('🎁 إهداء نقاط', 'gift_help')]
+    ]);
+}
+
+function homeKeyboard() {
+    return Markup.inlineKeyboard([
+        [Markup.button.callback('🏠 القائمة الرئيسية', 'main')]
+    ]);
+}
 
 async function showMain(ctx, edit) {
     const message =
-        '🎓 مرحباً بك في المكتبة الإلكترونية\n\n' +
-        '🏛️ جامعة كسلا - كلية الهندسة\n\n' +
-        'أهلاً بك عزيزي الطالب!\n\n' +
-        'يمكنك من هنا الوصول إلى المقررات الدراسية، ' +
-        'المحاضرات، الملخصات والامتحانات السابقة.\n\n' +
-        'اختر الخدمة التي تريدها:';
+        '👋 *مرحباً بك في لوحة تحكم NOQAT*\n\n' +
+        '🤖 هذا البوت مخصص لإدارة:\n' +
+        '• طلبات توثيق المستخدمين\n' +
+        '• إهداء النقاط للأعضاء\n' +
+        '• متابعة إحصائيات النظام\n\n' +
+        'اختر العملية المطلوبة:';
 
     if (edit) {
-        await safeEdit(ctx, message, mainKeyboard());
+        await safeEdit(ctx, message, { parse_mode: 'Markdown', ...mainKeyboard() });
     } else {
-        await ctx.reply(message, mainKeyboard());
+        await ctx.reply(message, { parse_mode: 'Markdown', ...mainKeyboard() });
     }
 }
 
+// =====================================
+// الأوامر
+// =====================================
+
 bot.start(async (ctx) => {
+    if (!isAdmin(ctx)) {
+        return ctx.reply('⛔ هذا البوت مخصص للمشرفين فقط.');
+    }
     resetState(ctx);
     await showMain(ctx, false);
 });
 
 bot.command('help', async (ctx) => {
+    if (!isAdmin(ctx)) return;
+
     await ctx.reply(
-        '📚 مرحباً بك في المكتبة الإلكترونية.\n\n' +
-        'استخدم الأزرار للتنقل بين التخصصات والمقررات.\n' +
-        'أرسل /start للعودة إلى البداية.'
+        '📖 *الأوامر المتاحة:*\n\n' +
+        '• `/start` — القائمة الرئيسية\n' +
+        '• `/gift NQ-12345678 100` — إهداء نقاط\n' +
+        '• `/stats` — الإحصائيات',
+        { parse_mode: 'Markdown' }
     );
+});
+
+bot.command('stats', async (ctx) => {
+    if (!isAdmin(ctx)) return;
+    await showStats(ctx);
+});
+
+bot.command('gift', async (ctx) => {
+    if (!isAdmin(ctx)) return;
+
+    const parts = ctx.message.text.split(' ').filter(Boolean);
+    if (parts.length < 3) {
+        return ctx.reply(
+            '⚠️ *الصيغة الصحيحة:*\n' +
+            '`/gift NQ-12345678 100`',
+            { parse_mode: 'Markdown' }
+        );
+    }
+
+    await handleGift(ctx, parts[1], parts[2]);
 });
 
 bot.action('main', async (ctx) => {
     await ctx.answerCbQuery();
-
     resetState(ctx);
-
     await showMain(ctx, true);
 });
 
 // =====================================
-// المحتوى الأكاديمي
+// طلبات التوثيق المعلقة
 // =====================================
 
-bot.action('academic', async (ctx) => {
+bot.action('pending_docs', async (ctx) => {
     await ctx.answerCbQuery();
-
-    setState(ctx, {
-        step: 'specialty',
-        specialty: null,
-        subSpecialty: null,
-        level: null,
-        semester: null,
-        courseId: null
-    });
-
-    await safeEdit(
-        ctx,
-        '📚 المحتوى الأكاديمي\n\n' +
-        'اختر تخصصك الدراسي:',
-        Markup.inlineKeyboard([
-            [
-                Markup.button.callback(
-                    '⚙️ ميكانيكا',
-                    'spec_mechanical'
-                )
-            ],
-            [
-                Markup.button.callback(
-                    '🏗️ مدنية',
-                    'spec_civil'
-                )
-            ],
-            [
-                Markup.button.callback(
-                    '⚡ كهرباء',
-                    'spec_electrical'
-                )
-            ],
-            [
-                Markup.button.callback(
-                    '🏠 الرئيسية',
-                    'main'
-                )
-            ]
-        ])
-    );
+    await showPendingDocuments(ctx);
 });
 
-// =====================================
-// اختيار التخصص
-// =====================================
-
-function showLevelButtons() {
-    const buttons = [];
-
-    for (let level = 1; level <= 5; level++) {
-        buttons.push([
-            Markup.button.callback(
-                'المستوى ' + level,
-                'level_' + level
-            )
-        ]);
-    }
-
-    buttons.push([
-        Markup.button.callback(
-            '🔙 تغيير التخصص',
-            'academic'
-        )
-    ]);
-
-    return Markup.inlineKeyboard(buttons);
-}
-
-bot.action('spec_mechanical', async (ctx) => {
-    await ctx.answerCbQuery();
-
-    setState(ctx, {
-        specialty: 'mechanical',
-        specialtyName: 'ميكانيكا',
-        subSpecialty: null,
-        step: 'level'
-    });
-
-    await safeEdit(
-        ctx,
-        '⚙️ تخصص الهندسة الميكانيكية\n\n' +
-        'اختر المستوى الدراسي:',
-        showLevelButtons()
-    );
-});
-
-bot.action('spec_civil', async (ctx) => {
-    await ctx.answerCbQuery();
-
-    setState(ctx, {
-        specialty: 'civil',
-        specialtyName: 'مدنية',
-        subSpecialty: null,
-        step: 'level'
-    });
-
-    await safeEdit(
-        ctx,
-        '🏗️ تخصص الهندسة المدنية\n\n' +
-        'اختر المستوى الدراسي:',
-        showLevelButtons()
-    );
-});
-
-bot.action('spec_electrical', async (ctx) => {
-    await ctx.answerCbQuery();
-
-    setState(ctx, {
-        specialty: 'electrical',
-        specialtyName: 'كهرباء',
-        subSpecialty: null,
-        step: 'level'
-    });
-
-    await safeEdit(
-        ctx,
-        '⚡ تخصص الهندسة الكهربائية\n\n' +
-        'المستويات الأول والثاني والثالث مشتركة.\n' +
-        'يبدأ اختيار التخصص الفرعي من المستوى الرابع.\n\n' +
-        'اختر المستوى الدراسي:',
-        showLevelButtons()
-    );
-});
-
-// =====================================
-// اختيار المستوى
-// =====================================
-
-bot.action(/^level_([1-5])$/, async (ctx) => {
-    await ctx.answerCbQuery();
-
-    const level = Number(ctx.match[1]);
-    const state = getState(ctx);
-
-    if (!state.specialty) {
-        await ctx.reply('يرجى اختيار التخصص أولاً.');
-        return;
-    }
-
-    setState(ctx, {
-        level: level,
-        semester: null,
-        courseId: null,
-        subSpecialty: null
-    });
-
-    // الكهرباء: المستويان الرابع والخامس يتفرعان
-    if (
-        state.specialty === 'electrical' &&
-        level >= 4
-    ) {
-        setState(ctx, {
-            step: 'sub_specialty'
-        });
-
-        await safeEdit(
-            ctx,
-            '⚡ الهندسة الكهربائية\n\n' +
-            'المستوى ' + level + '\n\n' +
-            'اختر التخصص الفرعي:',
-            Markup.inlineKeyboard([
-                [
-                    Markup.button.callback(
-                        '⚡ قدرة',
-                        'sub_power'
-                    )
-                ],
-                [
-                    Markup.button.callback(
-                        '📡 اتصالات',
-                        'sub_communications'
-                    )
-                ],
-                [
-                    Markup.button.callback(
-                        '🔙 تغيير المستوى',
-                        'academic'
-                    )
-                ]
-            ])
+async function showPendingDocuments(ctx) {
+    try {
+        const r = await pool.query(
+            `SELECT d.id, d.national_id, d.full_name_4, d.date_of_birth,
+                    d.image_data, d.created_at,
+                    u.username, u.member_number, u.full_name
+             FROM documents d
+             JOIN users u ON u.id = d.user_id
+             WHERE d.status = 'pending'
+             ORDER BY d.created_at ASC
+             LIMIT 10`
         );
 
-        return;
-    }
-
-    // بقية التخصصات والمستويات
-    setState(ctx, {
-        step: 'semester'
-    });
-
-    await showSemesterMenu(ctx);
-});
-
-// =====================================
-// اختيار التخصص الفرعي للكهرباء
-// =====================================
-
-bot.action('sub_power', async (ctx) => {
-    await ctx.answerCbQuery();
-
-    setState(ctx, {
-        specialty: 'power',
-        specialtyName: 'كهرباء - قدرة',
-        subSpecialty: 'power',
-        step: 'semester'
-    });
-
-    await showSemesterMenu(ctx);
-});
-
-bot.action('sub_communications', async (ctx) => {
-    await ctx.answerCbQuery();
-
-    setState(ctx, {
-        specialty: 'communications',
-        specialtyName: 'كهرباء - اتصالات',
-        subSpecialty: 'communications',
-        step: 'semester'
-    });
-
-    await showSemesterMenu(ctx);
-});
-
-// =====================================
-// قائمة الفصول الدراسية
-// =====================================
-
-async function showSemesterMenu(ctx) {
-    const state = getState(ctx);
-
-    await safeEdit(
-        ctx,
-        '📚 اختيار الفصل الدراسي\n\n' +
-        'التخصص: ' + state.specialtyName + '\n' +
-        'المستوى: ' + state.level + '\n\n' +
-        'اختر الفصل الدراسي:',
-        Markup.inlineKeyboard([
-            [
-                Markup.button.callback(
-                    '📘 الفصل الأول',
-                    'semester_1'
-                )
-            ],
-            [
-                Markup.button.callback(
-                    '📗 الفصل الثاني',
-                    'semester_2'
-                )
-            ],
-            [
-                Markup.button.callback(
-                    '🔙 تغيير المستوى',
-                    'academic'
-                )
-            ],
-            [
-                Markup.button.callback(
-                    '🏠 الرئيسية',
-                    'main'
-                )
-            ]
-        ])
-    );
-}
-
-// =====================================
-// قراءة مقررات الفصل
-// =====================================
-
-function getCourses(state) {
-    const library = loadLibrary();
-
-    if (
-        !state.specialty ||
-        !state.level ||
-        !state.semester
-    ) {
-        return {};
-    }
-
-    const specialtyData = library[state.specialty] || {};
-    const levelData = specialtyData[String(state.level)] || {};
-    const semesterData = levelData[String(state.semester)] || {};
-
-    return semesterData;
-}
-
-// =====================================
-// عرض المقررات
-// =====================================
-
-async function showCourses(ctx) {
-    const state = getState(ctx);
-    const courses = getCourses(state);
-
-    const courseEntries = Object.entries(courses);
-
-    if (courseEntries.length === 0) {
-        await safeEdit(
-            ctx,
-            '📂 لا توجد مقررات مضافة لهذا الفصل حالياً.\n\n' +
-            'يمكنك الرجوع واختيار فصل آخر.',
-            Markup.inlineKeyboard([
-                [
-                    Markup.button.callback(
-                        '🔙 تغيير الفصل',
-                        'back_semester'
-                    )
-                ],
-                [
-                    Markup.button.callback(
-                        '🏠 الرئيسية',
-                        'main'
-                    )
-                ]
-            ])
-        );
-
-        return;
-    }
-
-    const buttons = courseEntries.map(([id, course]) => [
-        Markup.button.callback(
-            course.name,
-            'course_' + id
-        )
-    ]);
-
-    buttons.push([
-        Markup.button.callback(
-            '🔙 تغيير الفصل',
-            'back_semester'
-        )
-    ]);
-
-    buttons.push([
-        Markup.button.callback(
-            '🏠 الرئيسية',
-            'main'
-        )
-    ]);
-
-    await safeEdit(
-        ctx,
-        '📚 المقررات الدراسية\n\n' +
-        'التخصص: ' + state.specialtyName + '\n' +
-        'المستوى: ' + state.level + '\n' +
-        'الفصل: ' + state.semester + '\n\n' +
-        'اختر المقرر:',
-        Markup.inlineKeyboard(buttons)
-    );
-}
-
-bot.action(/^semester_([12])$/, async (ctx) => {
-    await ctx.answerCbQuery();
-
-    const semester = Number(ctx.match[1]);
-
-    const state = getState(ctx);
-
-    if (!state.specialty || !state.level) {
-        await ctx.reply('يرجى اختيار التخصص والمستوى أولاً.');
-        return;
-    }
-
-    setState(ctx, {
-        semester: semester,
-        step: 'courses'
-    });
-
-    await showCourses(ctx);
-});
-
-bot.action('back_semester', async (ctx) => {
-    await ctx.answerCbQuery();
-
-    await showSemesterMenu(ctx);
-});
-
-// =====================================
-// اختيار مقرر
-// =====================================
-
-bot.action(/^course_(.+)$/, async (ctx) => {
-    await ctx.answerCbQuery();
-
-    const courseId = ctx.match[1];
-    const state = getState(ctx);
-    const courses = getCourses(state);
-    const course = courses[courseId];
-
-    if (!course) {
-        await ctx.reply(
-            'تعذر العثور على المقرر. يرجى العودة إلى قائمة المقررات.'
-        );
-        return;
-    }
-
-    setState(ctx, {
-        courseId: courseId,
-        courseName: course.name,
-        step: 'course_files'
-    });
-
-    await safeEdit(
-        ctx,
-        '📘 المقرر: ' + course.name + '\n\n' +
-        'اختر نوع المحتوى الذي تريد الوصول إليه:',
-        Markup.inlineKeyboard([
-            [
-                Markup.button.callback(
-                    '📚 المحاضرات',
-                    'files_lectures'
-                )
-            ],
-            [
-                Markup.button.callback(
-                    '📝 الامتحانات السابقة',
-                    'files_exams'
-                )
-            ],
-            [
-                Markup.button.callback(
-                    '📑 الملخصات',
-                    'files_summaries'
-                )
-            ],
-            [
-                Markup.button.callback(
-                    '🔙 المقررات',
-                    'back_courses'
-                )
-            ],
-            [
-                Markup.button.callback(
-                    '🏠 الرئيسية',
-                    'main'
-                )
-            ]
-        ])
-    );
-});
-
-bot.action('back_courses', async (ctx) => {
-    await ctx.answerCbQuery();
-
-    await showCourses(ctx);
-});
-
-// =====================================
-// إرسال ملفات PDF
-// =====================================
-
-const contentTypes = {
-    lectures: 'المحاضرات',
-    exams: 'الامتحانات السابقة',
-    summaries: 'الملخصات'
-};
-
-for (const [key, label] of Object.entries(contentTypes)) {
-    bot.action('files_' + key, async (ctx) => {
-        await ctx.answerCbQuery();
-
-        const state = getState(ctx);
-        const courses = getCourses(state);
-        const course = courses[state.courseId];
-
-        if (!course) {
-            await ctx.reply('لم أتمكن من العثور على المقرر.');
-            return;
-        }
-
-        const files = course[key] || [];
-
-        if (files.length === 0) {
-            await ctx.reply(
-                '📂 لا توجد ملفات في قسم ' + label +
-                ' لمقرر ' + course.name + ' حتى الآن.',
-                Markup.inlineKeyboard([
-                    [
-                        Markup.button.callback(
-                            '🔙 العودة للمقرر',
-                            'back_course'
-                        )
-                    ],
-                    [
-                        Markup.button.callback(
-                            '🏠 الرئيسية',
-                            'main'
-                        )
-                    ]
-                ])
+        if (r.rowCount === 0) {
+            return ctx.reply(
+                '✅ لا توجد طلبات توثيق معلقة حالياً.',
+                homeKeyboard()
             );
-
-            return;
         }
 
         await ctx.reply(
-            '📂 ' + label + '\n' +
-            '📘 المقرر: ' + course.name
+            `📋 *يوجد ${r.rowCount} طلب توثيق معلق:*`,
+            { parse_mode: 'Markdown' }
         );
 
-        for (const file of files) {
+        for (const doc of r.rows) {
+            const caption =
+                `👤 *الاسم:* ${doc.full_name_4}\n` +
+                `🆔 *الرقم الوطني:* \`${doc.national_id}\`\n` +
+                `🎂 *تاريخ الميلاد:* ${formatDate(doc.date_of_birth)}\n` +
+                `📅 *تاريخ التقديم:* ${formatDate(doc.created_at)}\n\n` +
+                `👥 *صاحب الحساب:*\n` +
+                `• الاسم: ${doc.full_name}\n` +
+                `• اسم المستخدم: @${doc.username}\n` +
+                `• رقم العضوية: \`${doc.member_number}\``;
+
+            const keyboard = Markup.inlineKeyboard([
+                [
+                    Markup.button.callback('✅ قبول', `approve_doc_${doc.id}`),
+                    Markup.button.callback('❌ رفض', `reject_doc_${doc.id}`)
+                ]
+            ]);
+
             try {
-                const caption = file.title || course.name;
+                const base64Data = (doc.image_data || '')
+                    .replace(/^data:image\/\w+;base64,/, '');
+                const imageBuffer = Buffer.from(base64Data, 'base64');
 
-                if (file.file_id) {
-                    await ctx.replyWithDocument(
-                        file.file_id,
-                        { caption: caption }
-                    );
-                } else if (file.url) {
-                    await ctx.replyWithDocument(
-                        {
-                            url: file.url,
-                            filename: file.filename || 'document.pdf'
-                        },
-                        { caption: caption }
-                    );
-                } else {
-                    await ctx.reply(
-                        'الملف لا يحتوي على رابط أو file_id صالح.'
-                    );
-                }
-            } catch (error) {
-                console.error(
-                    'خطأ في إرسال الملف:',
-                    error.message
+                await ctx.replyWithPhoto(
+                    { source: imageBuffer },
+                    {
+                        caption: caption,
+                        parse_mode: 'Markdown',
+                        ...keyboard
+                    }
                 );
-
-                await ctx.reply(
-                    'تعذر إرسال الملف: ' +
-                    (file.title || file.filename || 'PDF')
-                );
+            } catch (err) {
+                await ctx.reply(caption, {
+                    parse_mode: 'Markdown',
+                    ...keyboard
+                });
             }
         }
 
-        await ctx.reply(
-            'انتهى عرض الملفات.',
-            Markup.inlineKeyboard([
-                [
-                    Markup.button.callback(
-                        '🔙 العودة للمقرر',
-                        'back_course'
-                    )
-                ],
-                [
-                    Markup.button.callback(
-                        '🏠 الرئيسية',
-                        'main'
-                    )
-                ]
-            ])
-        );
-    });
+        await ctx.reply('— انتهى العرض —', homeKeyboard());
+    } catch (e) {
+        console.error('خطأ في جلب الطلبات:', e.message);
+        await ctx.reply('❌ حدث خطأ أثناء جلب الطلبات.');
+    }
 }
 
-bot.action('back_course', async (ctx) => {
+// =====================================
+// قبول التوثيق
+// =====================================
+
+bot.action(/^approve_doc_(\d+)$/, async (ctx) => {
     await ctx.answerCbQuery();
 
-    const state = getState(ctx);
-    const courses = getCourses(state);
-    const course = courses[state.courseId];
+    const docId = Number(ctx.match[1]);
+    const client = await pool.connect();
 
-    if (!course) {
-        await showCourses(ctx);
-        return;
+    try {
+        await client.query('BEGIN');
+
+        const docR = await client.query(
+            'SELECT * FROM documents WHERE id = $1 AND status = $2 FOR UPDATE',
+            [docId, 'pending']
+        );
+
+        if (docR.rowCount === 0) {
+            await client.query('ROLLBACK');
+            return ctx.reply('⚠️ المستند غير موجود أو تمت مراجعته مسبقاً.');
+        }
+
+        const doc = docR.rows[0];
+
+        await client.query(
+            'UPDATE documents SET status = $1, reviewed_at = NOW() WHERE id = $2',
+            ['approved', docId]
+        );
+
+        await client.query(
+            `UPDATE users
+             SET is_verified = TRUE, national_id = $1, date_of_birth = $2, updated_at = NOW()
+             WHERE id = $3`,
+            [doc.national_id, doc.date_of_birth, doc.user_id]
+        );
+
+        await client.query(
+            `INSERT INTO audit_logs (actor_user_id, action, target_user_id, metadata)
+             VALUES (NULL, 'bot_document_approve', $1, $2)`,
+            [doc.user_id, JSON.stringify({ documentId: docId, via: 'telegram_bot' })]
+        );
+
+        await client.query('COMMIT');
+
+        await ctx.editMessageCaption(
+            `✅ *تم قبول التوثيق*\n\n` +
+            `👤 ${doc.full_name_4}\n` +
+            `🆔 \`${doc.national_id}\``,
+            { parse_mode: 'Markdown' }
+        ).catch(() => {});
+
+        await ctx.reply('✅ تم توثيق الحساب بنجاح.', homeKeyboard());
+    } catch (e) {
+        await client.query('ROLLBACK');
+        console.error('خطأ في القبول:', e.message);
+        await ctx.reply('❌ حدث خطأ أثناء القبول.');
+    } finally {
+        client.release();
     }
-
-    await safeEdit(
-        ctx,
-        '📘 المقرر: ' + course.name + '\n\n' +
-        'اختر نوع المحتوى:',
-        Markup.inlineKeyboard([
-            [
-                Markup.button.callback(
-                    '📚 المحاضرات',
-                    'files_lectures'
-                )
-            ],
-            [
-                Markup.button.callback(
-                    '📝 الامتحانات',
-                    'files_exams'
-                )
-            ],
-            [
-                Markup.button.callback(
-                    '📑 الملخصات',
-                    'files_summaries'
-                )
-            ],
-            [
-                Markup.button.callback(
-                    '🔙 المقررات',
-                    'back_courses'
-                )
-            ],
-            [
-                Markup.button.callback(
-                    '🏠 الرئيسية',
-                    'main'
-                )
-            ]
-        ])
-    );
 });
 
 // =====================================
-// البحث عن مقرر
+// رفض التوثيق
 // =====================================
 
-bot.action('search_course', async (ctx) => {
+bot.action(/^reject_doc_(\d+)$/, async (ctx) => {
     await ctx.answerCbQuery();
 
-    setState(ctx, {
-        step: 'search'
-    });
+    const docId = Number(ctx.match[1]);
+
+    setState(ctx, { step: 'reject_reason', rejectDocId: docId });
 
     await ctx.reply(
-        '🔍 البحث عن مقرر\n\n' +
-        'أرسل اسم المقرر الذي تبحث عنه.\n\n' +
-        'مثال: الديناميكا الحرارية'
+        `✍️ أرسل الآن سبب رفض المستند رقم \`${docId}\` في رسالة نصية.`,
+        { parse_mode: 'Markdown' }
     );
 });
 
-function searchCourses(query) {
-    const library = loadLibrary();
-    const results = [];
-    const normalizedQuery = query.trim().toLowerCase();
+async function handleRejectReason(ctx, docId, reason) {
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
 
-    for (const [specialty, levels] of Object.entries(library)) {
-        for (const [level, semesters] of Object.entries(levels || {})) {
-            for (const [semester, courses] of Object.entries(semesters || {})) {
-                for (const [id, course] of Object.entries(courses || {})) {
-                    if (
-                        course.name &&
-                        course.name.toLowerCase().includes(normalizedQuery)
-                    ) {
-                        results.push({
-                            specialty: specialty,
-                            level: level,
-                            semester: semester,
-                            id: id,
-                            name: course.name
-                        });
-                    }
-                }
-            }
+        const docR = await client.query(
+            'SELECT * FROM documents WHERE id = $1 AND status = $2 FOR UPDATE',
+            [docId, 'pending']
+        );
+
+        if (docR.rowCount === 0) {
+            await client.query('ROLLBACK');
+            return ctx.reply('⚠️ المستند غير موجود أو تمت مراجعته مسبقاً.');
         }
+
+        const doc = docR.rows[0];
+
+        await client.query(
+            `UPDATE documents
+             SET status = $1, reviewed_at = NOW(), rejection_reason = $2
+             WHERE id = $3`,
+            ['rejected', reason, docId]
+        );
+
+        await client.query(
+            'UPDATE users SET is_verified = FALSE, updated_at = NOW() WHERE id = $1',
+            [doc.user_id]
+        );
+
+        await client.query(
+            `INSERT INTO audit_logs (actor_user_id, action, target_user_id, metadata)
+             VALUES (NULL, 'bot_document_reject', $1, $2)`,
+            [doc.user_id, JSON.stringify({ documentId: docId, reason, via: 'telegram_bot' })]
+        );
+
+        await client.query('COMMIT');
+
+        await ctx.reply(
+            `❌ *تم رفض التوثيق*\n\n` +
+            `👤 ${doc.full_name_4}\n` +
+            `📝 *السبب:* ${reason}`,
+            { parse_mode: 'Markdown', ...homeKeyboard() }
+        );
+    } catch (e) {
+        await client.query('ROLLBACK');
+        console.error('خطأ في الرفض:', e.message);
+        await ctx.reply('❌ حدث خطأ أثناء الرفض.');
+    } finally {
+        client.release();
+    }
+}
+
+// =====================================
+// إهداء النقاط
+// =====================================
+
+bot.action('gift_help', async (ctx) => {
+    await ctx.answerCbQuery();
+
+    await safeEdit(
+        ctx,
+        '🎁 *إهداء النقاط*\n\n' +
+        'استخدم الأمر التالي:\n' +
+        '`/gift NQ-12345678 100`\n\n' +
+        'حيث:\n' +
+        '• `NQ-12345678` رقم العضوية\n' +
+        '• `100` عدد النقاط',
+        { parse_mode: 'Markdown', ...homeKeyboard() }
+    );
+});
+
+async function handleGift(ctx, memberNumberRaw, amountRaw) {
+    const amount = parseInt(amountRaw, 10);
+
+    if (!Number.isInteger(amount) || amount <= 0) {
+        return ctx.reply('❌ المبلغ غير صحيح. يجب أن يكون رقماً صحيحاً موجباً.');
     }
 
-    return results;
+    let normalized = String(memberNumberRaw).trim().toUpperCase();
+    if (normalized.startsWith('NQ-')) normalized = normalized.substring(3);
+    normalized = normalized.replace(/[^0-9]/g, '');
+
+    if (!normalized) {
+        return ctx.reply('❌ رقم العضوية غير صالح.');
+    }
+
+    const memberNumber = 'NQ-' + normalized;
+    const client = await pool.connect();
+
+    try {
+        await client.query('BEGIN');
+
+        const uR = await client.query(
+            'SELECT * FROM users WHERE member_number = $1 FOR UPDATE',
+            [memberNumber]
+        );
+
+        if (uR.rowCount === 0) {
+            await client.query('ROLLBACK');
+            return ctx.reply(
+                `❌ لا يوجد مستخدم برقم العضوية: \`${memberNumber}\``,
+                { parse_mode: 'Markdown' }
+            );
+        }
+
+        const target = uR.rows[0];
+
+        await client.query(
+            'UPDATE users SET balance_points = balance_points + $1, updated_at = NOW() WHERE id = $2',
+            [amount, target.id]
+        );
+
+        const ref = 'TX-' + Date.now().toString(36).toUpperCase() +
+                    Math.random().toString(16).substring(2, 6).toUpperCase();
+
+        await client.query(
+            `INSERT INTO transactions
+             (reference_number, type, amount_points, fee_points, receiver_user_id, description)
+             VALUES ($1, 'admin_gift', $2, 0, $3, $4)`,
+            [ref, amount, target.id, 'إهداء من الإدارة']
+        );
+
+        await client.query(
+            `INSERT INTO audit_logs (actor_user_id, action, target_user_id, metadata)
+             VALUES (NULL, 'bot_gift_points', $1, $2)`,
+            [target.id, JSON.stringify({ amount, via: 'telegram_bot' })]
+        );
+
+        await client.query('COMMIT');
+
+        const newBalance = Number(target.balance_points) + amount;
+
+        await ctx.reply(
+            `🎁 *تم إهداء النقاط بنجاح*\n\n` +
+            `👤 *المستلم:* ${target.full_name}\n` +
+            `🔢 *رقم العضوية:* \`${target.member_number}\`\n` +
+            `➕ *النقاط المهداة:* ${formatNumber(amount)}\n` +
+            `💰 *الرصيد الجديد:* ${formatNumber(newBalance)}\n` +
+            `🧾 *رقم العملية:* \`${ref}\``,
+            { parse_mode: 'Markdown', ...homeKeyboard() }
+        );
+    } catch (e) {
+        await client.query('ROLLBACK');
+        console.error('خطأ في الإهداء:', e.message);
+        await ctx.reply('❌ حدث خطأ أثناء إهداء النقاط.');
+    } finally {
+        client.release();
+    }
 }
+
+// =====================================
+// الإحصائيات
+// =====================================
+
+bot.action('stats', async (ctx) => {
+    await ctx.answerCbQuery();
+    await showStats(ctx);
+});
+
+async function showStats(ctx) {
+    try {
+        const usersCount = (await pool.query('SELECT COUNT(*) AS c FROM users')).rows[0].c;
+        const verifiedCount = (await pool.query('SELECT COUNT(*) AS c FROM users WHERE is_verified = TRUE')).rows[0].c;
+        const pendingDocs = (await pool.query("SELECT COUNT(*) AS c FROM documents WHERE status = 'pending'")).rows[0].c;
+        const txCount = (await pool.query('SELECT COUNT(*) AS c FROM transactions')).rows[0].c;
+        const totalBalance = (await pool.query('SELECT COALESCE(SUM(balance_points), 0) AS s FROM users')).rows[0].s;
+
+        const message =
+            `📊 *إحصائيات النظام*\n\n` +
+            `👥 *إجمالي المستخدمين:* ${formatNumber(usersCount)}\n` +
+            `✅ *المستخدمون الموثقون:* ${formatNumber(verifiedCount)}\n` +
+            `⏳ *طلبات توثيق معلقة:* ${formatNumber(pendingDocs)}\n` +
+            `💸 *إجمالي المعاملات:* ${formatNumber(txCount)}\n` +
+            `💰 *إجمالي النقاط:* ${formatNumber(totalBalance)}`;
+
+        await safeEdit(ctx, message, { parse_mode: 'Markdown', ...homeKeyboard() });
+    } catch (e) {
+        console.error('خطأ في الإحصائيات:', e.message);
+        await ctx.reply('❌ حدث خطأ أثناء جلب الإحصائيات.');
+    }
+}
+
+// =====================================
+// استقبال النصوص
+// =====================================
 
 bot.on('text', async (ctx) => {
-    const state = getState(ctx);
-
-    if (state.step !== 'search') {
-        return;
-    }
-
-    const query = ctx.message.text.trim();
-
-    if (!query) {
-        await ctx.reply('يرجى كتابة اسم المقرر.');
-        return;
-    }
-
-    const results = searchCourses(query);
-
-    if (results.length === 0) {
-        setState(ctx, { step: 'main' });
-
-        await ctx.reply(
-            'لم يتم العثور على مقرر بهذا الاسم.\n' +
-            'حاول استخدام اسم مختلف.',
-            mainKeyboard()
-        );
-
-        return;
-    }
-
-    const visibleResults = results.slice(0, 20);
-
-    setState(ctx, {
-        step: 'search_results',
-        searchResults: visibleResults
-    });
-
-    const buttons = visibleResults.map((item, index) => [
-        Markup.button.callback(
-            item.name + ' — مستوى ' + item.level,
-            'search_result_' + index
-        )
-    ]);
-
-    buttons.push([
-        Markup.button.callback(
-            '🏠 الرئيسية',
-            'main'
-        )
-    ]);
-
-    await ctx.reply(
-        '🔎 نتائج البحث: ' + results.length + '\n\n' +
-        'اختر المقرر:',
-        Markup.inlineKeyboard(buttons)
-    );
-});
-
-bot.action(/^search_result_(\d+)$/, async (ctx) => {
-    await ctx.answerCbQuery();
+    if (!isAdmin(ctx)) return;
 
     const state = getState(ctx);
-    const index = Number(ctx.match[1]);
-    const item = (state.searchResults || [])[index];
 
-    if (!item) {
-        await ctx.reply(
-            'انتهت صلاحية نتيجة البحث. أعد البحث من جديد.'
-        );
-        return;
+    if (state.step === 'reject_reason' && state.rejectDocId) {
+        const reason = ctx.message.text.trim();
+        if (!reason) {
+            return ctx.reply('⚠️ يرجى إرسال سبب الرفض.');
+        }
+
+        const docId = state.rejectDocId;
+        setState(ctx, { step: 'main', rejectDocId: null });
+
+        return handleRejectReason(ctx, docId, reason);
     }
-
-    const library = loadLibrary();
-
-    const course =
-        library[item.specialty] &&
-        library[item.specialty][item.level] &&
-        library[item.specialty][item.level][item.semester] &&
-        library[item.specialty][item.level][item.semester][item.id];
-
-    if (!course) {
-        await ctx.reply('تعذر العثور على المقرر.');
-        return;
-    }
-
-    setState(ctx, {
-        specialty: item.specialty,
-        specialtyName: specialties[item.specialty] || item.specialty,
-        level: Number(item.level),
-        semester: Number(item.semester),
-        courseId: item.id,
-        courseName: course.name,
-        step: 'course_files'
-    });
-
-    await safeEdit(
-        ctx,
-        '📘 المقرر: ' + course.name + '\n\n' +
-        'اختر نوع المحتوى:',
-        Markup.inlineKeyboard([
-            [
-                Markup.button.callback(
-                    '📚 المحاضرات',
-                    'files_lectures'
-                )
-            ],
-            [
-                Markup.button.callback(
-                    '📝 الامتحانات',
-                    'files_exams'
-                )
-            ],
-            [
-                Markup.button.callback(
-                    '📑 الملخصات',
-                    'files_summaries'
-                )
-            ],
-            [
-                Markup.button.callback(
-                    '🏠 الرئيسية',
-                    'main'
-                )
-            ]
-        ])
-    );
-});
-
-// =====================================
-// معلومات المكتبة
-// =====================================
-
-bot.action('library_info', async (ctx) => {
-    await ctx.answerCbQuery();
-
-    await safeEdit(
-        ctx,
-        'ℹ️ المكتبة الإلكترونية\n\n' +
-        '🏛️ جامعة كسلا - كلية الهندسة\n\n' +
-        'تهدف المكتبة إلى تسهيل الوصول إلى المواد الأكاديمية، ' +
-        'بما في ذلك المحاضرات والملخصات والامتحانات السابقة.\n\n' +
-        'يتم تنظيم المحتوى حسب التخصص والمستوى والفصل الدراسي.\n\n' +
-        'توفر الملفات يعتمد على ما تتم إضافته إلى المكتبة.',
-        Markup.inlineKeyboard([
-            [
-                Markup.button.callback(
-                    '📚 تصفح المحتوى',
-                    'academic'
-                )
-            ],
-            [
-                Markup.button.callback(
-                    '🏠 الرئيسية',
-                    'main'
-                )
-            ]
-        ])
-    );
-});
-
-// =====================================
-// التواصل مع الإدارة
-// =====================================
-
-bot.action('contact', async (ctx) => {
-    await ctx.answerCbQuery();
-
-    await safeEdit(
-        ctx,
-        '📩 التواصل مع إدارة المكتبة\n\n' +
-        'لم يتم تحديد حساب المسؤول بعد.\n\n' +
-        'يمكن إضافة اسم المستخدم الخاص بالإدارة لاحقاً.',
-        homeKeyboard()
-    );
 });
 
 // =====================================
@@ -1054,10 +555,7 @@ bot.action('contact', async (ctx) => {
 // =====================================
 
 bot.catch((error, ctx) => {
-    console.error(
-        'حدث خطأ أثناء معالجة التحديث:',
-        error.message
-    );
+    console.error('خطأ في البوت:', error.message);
 });
 
 // =====================================
@@ -1066,19 +564,18 @@ bot.catch((error, ctx) => {
 
 bot.launch()
     .then(() => {
-        console.log('Telegram bot started successfully');
+        console.log('🤖 Telegram bot started successfully');
     })
     .catch((error) => {
-        console.error(
-            'Failed to start Telegram bot:',
-            error.message
-        );
+        console.error('فشل تشغيل البوت:', error.message);
     });
 
-process.once('SIGINT', () => {
+// إغلاق نظيف
+process.once('SIGINT', async () => {
     bot.stop('SIGINT');
+    await pool.end();
 });
-
-process.once('SIGTERM', () => {
+process.once('SIGTERM', async () => {
     bot.stop('SIGTERM');
+    await pool.end();
 });

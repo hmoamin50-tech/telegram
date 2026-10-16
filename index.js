@@ -148,7 +148,7 @@ async function showMain(ctx, edit) {
         '👋 *مرحباً بك في لوحة تحكم NOQAT*\n\n' +
         '🎛️ *الصلاحيات المتاحة:*\n' +
         '• إدارة طلبات التوثيق\n' +
-        '• إدارة الأعضاء (حظر، تجميد، حذف)\n' +
+        '• إدارة الأعضاء (حظر، تجميد، حذف، توثيق، إلغاء توثيق)\n' +
         '• شحن وخصم وإهداء النقاط\n' +
         '• متابعة الإحصائيات والمعاملات\n\n' +
         'اختر العملية:';
@@ -218,7 +218,6 @@ bot.action('users_menu', async (ctx) => {
     );
 });
 
-// عرض قائمة الأعضاء مع التصفح
 async function showUsersList(ctx, filter, page = 0, searchQuery = null) {
     const limit = 10;
     const offset = page * limit;
@@ -277,7 +276,6 @@ async function showUsersList(ctx, filter, page = 0, searchQuery = null) {
         text += `   💰 ${formatNumber(u.balance_points)} | ID: \`${u.id}\`\n\n`;
     }
 
-    // أزرار التصفح
     const navButtons = [];
     if (page > 0) navButtons.push(Markup.button.callback('⬅️ السابق', `users_${filter}_${page - 1}${searchQuery ? '_' + searchQuery : ''}`));
     if (offset + limit < total) navButtons.push(Markup.button.callback('➡️ التالي', `users_${filter}_${page + 1}${searchQuery ? '_' + searchQuery : ''}`));
@@ -473,31 +471,154 @@ bot.action(/^user_delete_confirm_(\d+)$/, async (ctx) => {
 });
 
 // =====================================
-// التوثيق اليدوي / الإلغاء
+// ✅ التوثيق اليدوي (ينشئ سجل في documents)
 // =====================================
 
 bot.action(/^user_verify_(\d+)$/, async (ctx) => {
     await ctx.answerCbQuery();
     const userId = Number(ctx.match[1]);
 
-    await pool.query(
-        'UPDATE users SET is_verified = TRUE, updated_at = NOW() WHERE id = $1',
-        [userId]
-    );
-    await ctx.answerCbQuery('✅ تم التوثيق', { show_alert: true });
-    await showUserDetails(ctx, userId);
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+
+        const userR = await client.query(
+            'SELECT id, username, national_id, date_of_birth, full_name FROM users WHERE id = $1 FOR UPDATE',
+            [userId]
+        );
+
+        if (userR.rowCount === 0) {
+            await client.query('ROLLBACK');
+            return ctx.reply('❌ العضو غير موجود.');
+        }
+
+        const target = userR.rows[0];
+
+        // تحديث حالة التوثيق
+        await client.query(
+            'UPDATE users SET is_verified = TRUE, updated_at = NOW() WHERE id = $1',
+            [userId]
+        );
+
+        // إنشاء أو تحديث سجل المستند لضمان التكامل
+        const existing = await client.query(
+            'SELECT id FROM documents WHERE user_id = $1',
+            [userId]
+        );
+
+        if (existing.rowCount > 0) {
+            await client.query(
+                `UPDATE documents 
+                 SET status = 'approved', reviewed_at = NOW(), rejection_reason = NULL 
+                 WHERE user_id = $1`,
+                [userId]
+            );
+        } else {
+            await client.query(
+                `INSERT INTO documents 
+                 (user_id, national_id, full_name_4, date_of_birth, image_data, status, reviewed_at)
+                 VALUES ($1, $2, $3, $4, NULL, 'approved', NOW())`,
+                [
+                    userId,
+                    target.national_id || '00000000000',
+                    target.full_name || '—',
+                    target.date_of_birth || '2000-01-01'
+                ]
+            );
+        }
+
+        await client.query(
+            `INSERT INTO audit_logs (actor_user_id, action, target_user_id, metadata)
+             VALUES (NULL, 'bot_manual_verify', $1, $2)`,
+            [userId, JSON.stringify({ via: 'telegram_bot' })]
+        );
+
+        await client.query('COMMIT');
+
+        await ctx.answerCbQuery('✅ تم التوثيق اليدوي', { show_alert: true });
+        await showUserDetails(ctx, userId);
+    } catch (e) {
+        await client.query('ROLLBACK');
+        console.error('خطأ:', e.message);
+        await ctx.reply('❌ خطأ: ' + e.message);
+    } finally {
+        client.release();
+    }
 });
+
+// =====================================
+// ✅ إلغاء التوثيق (يحذف سجل المستند)
+// =====================================
 
 bot.action(/^user_unverify_(\d+)$/, async (ctx) => {
     await ctx.answerCbQuery();
     const userId = Number(ctx.match[1]);
 
-    await pool.query(
-        'UPDATE users SET is_verified = FALSE, updated_at = NOW() WHERE id = $1',
-        [userId]
+    // نطلب تأكيداً لأن هذه العملية مهمة
+    await safeEdit(
+        ctx,
+        `⚠️ *تأكيد إلغاء التوثيق*\n\n` +
+        `سيتم إلغاء توثيق العضو رقم \`${userId}\`\n` +
+        `وحذف سجل التوثيق. سيتمكن من إرسال طلب توثيق جديد.`,
+        {
+            parse_mode: 'Markdown',
+            ...Markup.inlineKeyboard([
+                [Markup.button.callback('✅ نعم، ألغِ التوثيق', `user_unverify_confirm_${userId}`)],
+                [Markup.button.callback('❌ إلغاء', `user_view_${userId}`)]
+            ])
+        }
     );
-    await ctx.answerCbQuery('✅ تم إلغاء التوثيق', { show_alert: true });
-    await showUserDetails(ctx, userId);
+});
+
+bot.action(/^user_unverify_confirm_(\d+)$/, async (ctx) => {
+    await ctx.answerCbQuery();
+    const userId = Number(ctx.match[1]);
+
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+
+        const userR = await client.query(
+            'SELECT id, username FROM users WHERE id = $1 FOR UPDATE',
+            [userId]
+        );
+
+        if (userR.rowCount === 0) {
+            await client.query('ROLLBACK');
+            return ctx.reply('❌ العضو غير موجود.');
+        }
+
+        // إلغاء التوثيق
+        await client.query(
+            `UPDATE users 
+             SET is_verified = FALSE, 
+                 national_id = NULL, 
+                 date_of_birth = NULL, 
+                 updated_at = NOW() 
+             WHERE id = $1`,
+            [userId]
+        );
+
+        // حذف سجل المستند ليتمكن من إرسال طلب جديد
+        await client.query('DELETE FROM documents WHERE user_id = $1', [userId]);
+
+        await client.query(
+            `INSERT INTO audit_logs (actor_user_id, action, target_user_id, metadata)
+             VALUES (NULL, 'bot_unverify', $1, $2)`,
+            [userId, JSON.stringify({ via: 'telegram_bot' })]
+        );
+
+        await client.query('COMMIT');
+
+        await ctx.answerCbQuery('✅ تم إلغاء التوثيق', { show_alert: true });
+        await showUserDetails(ctx, userId);
+    } catch (e) {
+        await client.query('ROLLBACK');
+        console.error('خطأ:', e.message);
+        await ctx.reply('❌ خطأ: ' + e.message);
+    } finally {
+        client.release();
+    }
 });
 
 // =====================================
@@ -756,11 +877,15 @@ bot.action('pending_docs', async (ctx) => {
 
             try {
                 const base64Data = (doc.image_data || '').replace(/^data:image\/\w+;base64,/, '');
-                const imageBuffer = Buffer.from(base64Data, 'base64');
-                await ctx.replyWithPhoto(
-                    { source: imageBuffer },
-                    { caption, parse_mode: 'Markdown', ...keyboard }
-                );
+                if (base64Data) {
+                    const imageBuffer = Buffer.from(base64Data, 'base64');
+                    await ctx.replyWithPhoto(
+                        { source: imageBuffer },
+                        { caption, parse_mode: 'Markdown', ...keyboard }
+                    );
+                } else {
+                    await ctx.reply(caption, { parse_mode: 'Markdown', ...keyboard });
+                }
             } catch (err) {
                 await ctx.reply(caption, { parse_mode: 'Markdown', ...keyboard });
             }
@@ -1047,4 +1172,3 @@ process.once('SIGTERM', async () => {
     bot.stop('SIGTERM');
     await pool.end();
 });
-

@@ -1,16 +1,26 @@
 {
-  "name": "noqat-server",
+  "name": "noqat-admin-bot",
   "version": "1.0.0",
+  "description": "NOQAT Admin Telegram Bot - إدارة الأعضاء والتوثيق والنقاط",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "keywords": [
+    "telegram",
+    "bot",
+    "noqat",
+    "admin"
+  ],
+  "author": "NOQAT",
+  "license": "MIT",
   "dependencies": {
-    "bcryptjs": "^2.4.3",
-    "cors": "^2.8.5",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
-    "jsonwebtoken": "^9.0.2",
-    "pg": "^8.12.0"
+    "pg": "^8.12.0",
+    "telegraf": "^4.16.3"
   }
 }

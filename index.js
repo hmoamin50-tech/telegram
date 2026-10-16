@@ -1,1204 +1,1335 @@
-const { Telegraf, Markup } = require('telegraf');
-const express = require('express');
-const { Pool } = require('pg');
 require('dotenv').config();
-
-// =====================================
-// إعداد خادم HTTP
-// =====================================
+const express = require('express');
+const cors = require('cors');
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+const { Pool } = require('pg');
+const crypto = require('crypto');
 
 const app = express();
-const port = process.env.PORT || 3000;
+const PORT = process.env.PORT || 3000;
+const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret-change-in-production';
+const JWT_EXPIRES_IN = '7d';
+const TRANSFER_FEE = 5;
 
-app.get('/', (req, res) => {
-    res.send('بوت NOQAT الإداري يعمل بنجاح ✅');
-});
+const ADMIN_USERNAMES = (process.env.ADMIN_USERNAMES || '')
+  .split(',')
+  .map(s => s.trim())
+  .filter(Boolean);
 
-app.listen(port, () => {
-    console.log('HTTP server running on port ' + port);
-});
-
-// =====================================
-// إعداد قاعدة البيانات
-// =====================================
-
-if (!process.env.DATABASE_URL) {
-    console.error('خطأ: DATABASE_URL غير موجود');
-    process.exit(1);
-}
-
+// ---------- قاعدة البيانات ----------
 const pool = new Pool({
-    connectionString: process.env.DATABASE_URL,
-    ssl: process.env.DB_SSL === 'true' ||
-         (process.env.DATABASE_URL || '').includes('supabase')
-        ? { rejectUnauthorized: false }
-        : false,
-    max: 5,
-    idleTimeoutMillis: 30000,
-    connectionTimeoutMillis: 15000
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.DATABASE_URL && process.env.DATABASE_URL.includes('supabase')
+    ? { rejectUnauthorized: false }
+    : false,
+  max: 5,
+  idleTimeoutMillis: 30000,
+  connectionTimeoutMillis: 15000,
 });
 
 pool.on('error', (err) => {
-    console.error('خطأ DB:', err.message);
+  console.error('❌ Unexpected DB error:', err.message);
 });
 
-// =====================================
-// إعداد البوت
-// =====================================
+// ---------- Middleware ----------
+app.disable('x-powered-by');
+app.use(cors());
+app.use(express.json({ limit: '5mb' }));  // ✅ زيادة الحد لاستقبال الصور
 
-if (!process.env.BOT_TOKEN) {
-    console.error('خطأ: BOT_TOKEN غير موجود');
-    process.exit(1);
+const loginAttempts = new Map();
+const MAX_LOGIN_ATTEMPTS = 10;
+const LOGIN_WINDOW_MS = 15 * 60 * 1000;
+
+function checkRateLimit(key) {
+  const now = Date.now();
+  const entry = loginAttempts.get(key);
+  if (!entry || now - entry.start > LOGIN_WINDOW_MS) {
+    loginAttempts.set(key, { count: 1, start: now });
+    return true;
+  }
+  entry.count++;
+  return entry.count <= MAX_LOGIN_ATTEMPTS;
 }
 
-const bot = new Telegraf(process.env.BOT_TOKEN);
+// ---------- إنشاء الجداول ----------
+async function initDb() {
+  const client = await pool.connect();
+  try {
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS users (
+        id              BIGSERIAL PRIMARY KEY,
+        member_number   VARCHAR(20) UNIQUE NOT NULL,
+        full_name       VARCHAR(120) NOT NULL,
+        username        VARCHAR(40) UNIQUE NOT NULL,
+        phone           VARCHAR(20),
+        password_hash   VARCHAR(200) NOT NULL,
+        status          VARCHAR(20) NOT NULL DEFAULT 'active',
+        balance_points  BIGINT NOT NULL DEFAULT 0 CHECK (balance_points >= 0),
+        created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+    `);
 
-// دعم عدة أدمن (يمكن إضافة أكثر من معرف مفصول بفواصل)
-const ADMIN_IDS = String(process.env.ADMIN_CHAT_ID || '')
-    .split(',')
-    .map(s => s.trim())
-    .filter(Boolean);
+    await client.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS is_admin BOOLEAN NOT NULL DEFAULT FALSE`);
+    await client.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS is_verified BOOLEAN NOT NULL DEFAULT FALSE`);
+    await client.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS national_id VARCHAR(20)`);
+    await client.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS date_of_birth DATE`);
 
-const userState = new Map();
+    // ✅ جدول المستندات: قيد UNIQUE على user_id فقط
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS documents (
+        id              BIGSERIAL PRIMARY KEY,
+        user_id         BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        national_id     VARCHAR(20) NOT NULL,
+        full_name_4     VARCHAR(255) NOT NULL,
+        date_of_birth   DATE NOT NULL,
+        image_data      TEXT,
+        status          VARCHAR(20) NOT NULL DEFAULT 'pending',
+        reviewed_by     BIGINT REFERENCES users(id),
+        reviewed_at     TIMESTAMPTZ,
+        rejection_reason TEXT,
+        created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+    `);
 
-// =====================================
-// أدوات مساعدة
-// =====================================
+    // ✅ إزالة القيد القديم على national_id (إذا كان موجوداً)
+    await client.query(`
+      ALTER TABLE documents 
+      DROP CONSTRAINT IF EXISTS documents_national_id_key
+    `);
 
-function isAdmin(ctx) {
-    return ADMIN_IDS.includes(String(ctx.from.id));
-}
+    // ✅ إضافة قيد UNIQUE على user_id
+    await client.query(`
+      DO $$
+      BEGIN
+        IF NOT EXISTS (
+          SELECT 1 FROM pg_constraint 
+          WHERE conname = 'documents_user_id_unique'
+        ) THEN
+          ALTER TABLE documents ADD CONSTRAINT documents_user_id_unique UNIQUE (user_id);
+        END IF;
+      END $$;
+    `);
 
-function formatDate(dateStr) {
-    if (!dateStr) return '—';
-    const d = new Date(dateStr);
-    return d.toISOString().split('T')[0];
-}
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS transactions (
+        id                  BIGSERIAL PRIMARY KEY,
+        reference_number    VARCHAR(30) UNIQUE NOT NULL,
+        type                VARCHAR(30) NOT NULL,
+        status              VARCHAR(20) NOT NULL DEFAULT 'completed',
+        amount_points       BIGINT NOT NULL,
+        fee_points          BIGINT NOT NULL DEFAULT 0,
+        sender_user_id      BIGINT REFERENCES users(id),
+        receiver_user_id    BIGINT REFERENCES users(id),
+        initiated_by        BIGINT REFERENCES users(id),
+        description         TEXT,
+        idempotency_key     VARCHAR(64) UNIQUE,
+        created_at          TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+    `);
 
-function formatDateTime(dateStr) {
-    if (!dateStr) return '—';
-    const d = new Date(dateStr);
-    return d.toISOString().replace('T', ' ').substring(0, 19);
-}
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS audit_logs (
+        id              BIGSERIAL PRIMARY KEY,
+        actor_user_id   BIGINT REFERENCES users(id),
+        action          VARCHAR(50) NOT NULL,
+        target_user_id  BIGINT REFERENCES users(id),
+        metadata        JSONB,
+        created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+    `);
 
-function formatNumber(n) {
-    return new Intl.NumberFormat('en-US').format(Number(n) || 0);
-}
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_users_username ON users(username)`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_users_member_number ON users(member_number)`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_documents_status ON documents(status)`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_documents_user ON documents(user_id)`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_tx_sender ON transactions(sender_user_id)`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_tx_receiver ON transactions(receiver_user_id)`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_tx_created ON transactions(created_at DESC)`);
+    await client.query(`CREATE INDEX IF NOT EXISTS idx_audit_actor ON audit_logs(actor_user_id)`);
 
-function getState(ctx) {
-    return userState.get(ctx.from.id) || {};
-}
-
-function setState(ctx, values) {
-    const old = getState(ctx);
-    userState.set(ctx.from.id, { ...old, ...values });
-}
-
-function resetState(ctx) {
-    userState.set(ctx.from.id, { step: 'main' });
-}
-
-function escapeMd(str) {
-    if (!str) return '';
-    return String(str).replace(/[_*[\]()~`>#+\-=|{}.!]/g, '\\$&');
-}
-
-async function safeEdit(ctx, text, keyboard) {
-    try {
-        await ctx.editMessageText(text, keyboard);
-    } catch (error) {
-        if (error.description && error.description.includes('message is not modified')) {
-            return;
-        }
-        await ctx.reply(text, keyboard);
+    if (ADMIN_USERNAMES.length > 0) {
+      await client.query(
+        `UPDATE users SET is_admin = TRUE WHERE username = ANY($1::text[])`,
+        [ADMIN_USERNAMES]
+      );
     }
+
+    console.log('✅ Tables ready');
+  } finally {
+    client.release();
+  }
+}
+
+// ---------- أدوات ----------
+function generateMemberNumber() {
+  const n = Math.floor(10000000 + Math.random() * 90000000);
+  return `NQ-${n}`;
+}
+
+function generateReference() {
+  return 'TX-' + Date.now().toString(36).toUpperCase()
+       + crypto.randomBytes(2).toString('hex').toUpperCase();
 }
 
 function normalizeMemberNumber(input) {
-    if (!input) return null;
-    let s = String(input).trim().toUpperCase();
-    if (s.startsWith('NQ-')) s = s.substring(3);
-    s = s.replace(/[^0-9]/g, '');
-    if (!s) return null;
-    return 'NQ-' + s;
+  if (!input) return null;
+  let s = String(input).trim().toUpperCase();
+  if (s.startsWith('NQ-')) s = s.substring(3);
+  s = s.replace(/[^0-9]/g, '');
+  if (s.length === 0) return null;
+  return 'NQ-' + s;
 }
 
-// =====================================
-// القوائم
-// =====================================
-
-function mainKeyboard() {
-    return Markup.inlineKeyboard([
-        [Markup.button.callback('📋 طلبات التوثيق', 'pending_docs')],
-        [Markup.button.callback('👥 إدارة الأعضاء', 'users_menu')],
-        [Markup.button.callback('💰 إدارة الرصيد', 'balance_menu')],
-        [Markup.button.callback('📊 الإحصائيات', 'stats')],
-        [Markup.button.callback('💸 آخر المعاملات', 'recent_tx')]
-    ]);
+function parsePositiveInt(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || !Number.isInteger(n) || n <= 0) return null;
+  return n;
 }
 
-function homeKeyboard() {
-    return Markup.inlineKeyboard([
-        [Markup.button.callback('🏠 القائمة الرئيسية', 'main')]
-    ]);
+function issueToken(user) {
+  return jwt.sign(
+    { sub: String(user.id), username: user.username },
+    JWT_SECRET,
+    { expiresIn: JWT_EXPIRES_IN }
+  );
 }
 
-async function showMain(ctx, edit) {
-    const message =
-        '👋 *مرحباً بك في لوحة تحكم NOQAT*\n\n' +
-        '🎛️ *الصلاحيات المتاحة:*\n' +
-        '• إدارة طلبات التوثيق\n' +
-        '• إدارة الأعضاء (حظر، تجميد، حذف، توثيق، إلغاء توثيق)\n' +
-        '• شحن وخصم وإهداء النقاط\n' +
-        '• متابعة الإحصائيات والمعاملات\n\n' +
-        'اختر العملية:';
+function publicUser(row) {
+  return {
+    id: Number(row.id),
+    memberNumber: row.member_number,
+    fullName: row.full_name,
+    username: row.username,
+    phone: row.phone,
+    status: row.status,
+    balancePoints: Number(row.balance_points),
+    isAdmin: !!row.is_admin,
+    isVerified: !!row.is_verified,
+    joinedAt: row.created_at
+  };
+}
 
-    if (edit) {
-        await safeEdit(ctx, message, { parse_mode: 'Markdown', ...mainKeyboard() });
-    } else {
-        await ctx.reply(message, { parse_mode: 'Markdown', ...mainKeyboard() });
+// ---------- Middleware ----------
+function authRequired(req, res, next) {
+  const header = req.headers.authorization || '';
+  const token = header.startsWith('Bearer ') ? header.slice(7) : null;
+  if (!token) {
+    return res.status(401).json({ success: false, code: 'NO_TOKEN', message: 'لم يتم توفير رمز الدخول' });
+  }
+  try {
+    const payload = jwt.verify(token, JWT_SECRET);
+    req.userId = payload.sub;
+    next();
+  } catch (e) {
+    return res.status(401).json({ success: false, code: 'INVALID_TOKEN', message: 'رمز الدخول غير صالح' });
+  }
+}
+
+async function adminRequired(req, res, next) {
+  try {
+    const r = await pool.query('SELECT is_admin FROM users WHERE id = $1', [req.userId]);
+    if (r.rowCount === 0 || !r.rows[0].is_admin) {
+      return res.status(403).json({ success: false, code: 'ADMIN_ONLY', message: 'مخصص للمشرفين فقط' });
     }
+    next();
+  } catch (e) { next(e); }
 }
 
-// =====================================
-// الأوامر
-// =====================================
+// ---------- الصفحة الرئيسية ----------
+app.get('/', async (req, res) => {
+  let userCount = 0, txCount = 0, dbStatus = 'unknown';
+  try {
+    const r1 = await pool.query('SELECT COUNT(*) AS c FROM users');
+    userCount = Number(r1.rows[0].c);
+    const r2 = await pool.query('SELECT COUNT(*) AS c FROM transactions');
+    txCount = Number(r2.rows[0].c);
+    dbStatus = 'connected';
+  } catch (e) { dbStatus = 'error: ' + e.message; }
 
-bot.start(async (ctx) => {
-    if (!isAdmin(ctx)) {
-        return ctx.reply('⛔ هذا البوت مخصص للمشرفين فقط.');
+  res.send(`
+    <!DOCTYPE html>
+    <html dir="rtl" lang="ar">
+    <head>
+      <meta charset="utf-8"><title>NOQAT API</title>
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <style>
+        body{font-family:-apple-system,sans-serif;background:#102C27;color:#E0F3EB;padding:40px;max-width:600px;margin:0 auto;line-height:1.8}
+        h1{color:#fff} code{background:#146752;padding:3px 8px;border-radius:6px}
+        .card{background:#146752;padding:20px;border-radius:12px;margin-top:20px}
+        .ok{color:#A8E6CF}.err{color:#FFB4B4}
+      </style>
+    </head>
+    <body>
+      <h1>NOQAT API ✓</h1>
+      <div class="card">
+        <p><strong>المستخدمون:</strong> ${userCount}</p>
+        <p><strong>المعاملات:</strong> ${txCount}</p>
+        <p><strong>قاعدة البيانات:</strong> <span class="${dbStatus === 'connected' ? 'ok' : 'err'}">${dbStatus}</span></p>
+        <p><strong>عدد الأدمن:</strong> ${ADMIN_USERNAMES.length}</p>
+      </div>
+    </body></html>
+  `);
+});
+
+app.get('/health', async (req, res) => {
+  try {
+    const r = await pool.query('SELECT COUNT(*) AS c FROM users');
+    res.json({ status: 'ok', usersCount: Number(r.rows[0].c), db: 'connected' });
+  } catch (e) {
+    res.status(500).json({ status: 'error', db: e.message });
+  }
+});
+
+// ---------- المصادقة ----------
+app.post('/api/auth/register', async (req, res, next) => {
+  try {
+    const { fullName, username, phone, password } = req.body || {};
+    if (!fullName || !username || !password) {
+      return res.status(400).json({ success: false, code: 'MISSING_FIELDS', message: 'الاسم واسم المستخدم وكلمة المرور مطلوبة' });
     }
-    resetState(ctx);
-    await showMain(ctx, false);
-});
-
-bot.command('help', async (ctx) => {
-    if (!isAdmin(ctx)) return;
-    await ctx.reply(
-        '📖 *الأوامر المتاحة:*\n\n' +
-        '`/start` — القائمة الرئيسية\n' +
-        '`/stats` — الإحصائيات\n' +
-        '`/users` — إدارة الأعضاء\n' +
-        '`/gift NQ-12345678 100` — إهداء نقاط\n' +
-        '`/credit NQ-12345678 100` — شحن\n' +
-        '`/debit NQ-12345678 100` — خصم\n' +
-        '`/find NQ-12345678` — البحث عن عضو',
-        { parse_mode: 'Markdown' }
-    );
-});
-
-bot.action('main', async (ctx) => {
-    await ctx.answerCbQuery();
-    resetState(ctx);
-    await showMain(ctx, true);
-});
-
-// =====================================
-// إدارة الأعضاء
-// =====================================
-
-bot.action('users_menu', async (ctx) => {
-    await ctx.answerCbQuery();
-    resetState(ctx);
-
-    await safeEdit(
-        ctx,
-        '👥 *إدارة الأعضاء*\n\nاختر العملية:',
-        {
-            parse_mode: 'Markdown',
-            ...Markup.inlineKeyboard([
-                [Markup.button.callback('📋 عرض جميع الأعضاء', 'users_list_0')],
-                [Markup.button.callback('🔍 البحث عن عضو', 'users_search')],
-                [Markup.button.callback('✅ الموثقون', 'users_verified_0')],
-                [Markup.button.callback('⏳ غير الموثقين', 'users_unverified_0')],
-                [Markup.button.callback('🚫 المحظورون', 'users_suspended_0')],
-                [Markup.button.callback('🏠 الرئيسية', 'main')]
-            ])
-        }
-    );
-});
-
-async function showUsersList(ctx, filter, page = 0, searchQuery = null) {
-    const limit = 10;
-    const offset = page * limit;
-
-    let whereClause = '';
-    const params = [];
-
-    if (filter === 'verified') {
-        whereClause = 'WHERE is_verified = TRUE';
-    } else if (filter === 'unverified') {
-        whereClause = 'WHERE is_verified = FALSE';
-    } else if (filter === 'suspended') {
-        whereClause = "WHERE status = 'suspended'";
-    } else if (filter === 'search' && searchQuery) {
-        whereClause = 'WHERE username ILIKE $1 OR full_name ILIKE $1 OR member_number ILIKE $1';
-        params.push('%' + searchQuery + '%');
+    if (!/^[A-Za-z0-9_]{3,20}$/.test(username)) {
+      return res.status(400).json({ success: false, code: 'INVALID_USERNAME', message: 'اسم المستخدم غير صالح' });
     }
+    if (password.length < 6) {
+      return res.status(400).json({ success: false, code: 'WEAK_PASSWORD', message: 'كلمة المرور قصيرة جدًا' });
+    }
+    const exists = await pool.query('SELECT id FROM users WHERE username = $1', [username]);
+    if (exists.rowCount > 0) {
+      return res.status(409).json({ success: false, code: 'USERNAME_TAKEN', message: 'اسم المستخدم مستخدم مسبقًا' });
+    }
+    const passwordHash = await bcrypt.hash(password, 10);
 
-    const countQuery = `SELECT COUNT(*) AS c FROM users ${whereClause}`;
-    const countResult = await pool.query(countQuery, params);
-    const total = Number(countResult.rows[0].c);
-
-    const listQuery = `
-        SELECT id, username, full_name, member_number, balance_points, 
-               is_verified, status, is_admin, created_at
-        FROM users
-        ${whereClause}
-        ORDER BY id DESC
-        LIMIT $${params.length + 1} OFFSET $${params.length + 2}
-    `;
-    const listResult = await pool.query(listQuery, [...params, limit, offset]);
-
-    if (listResult.rowCount === 0) {
-        return safeEdit(
-            ctx,
-            '📭 لا يوجد أعضاء مطابقون.',
-            {
-                parse_mode: 'Markdown',
-                ...Markup.inlineKeyboard([
-                    [Markup.button.callback('🔙 رجوع', 'users_menu')],
-                    [Markup.button.callback('🏠 الرئيسية', 'main')]
-                ])
-            }
+    let inserted = null, attempts = 0;
+    while (attempts < 5) {
+      const memberNumber = generateMemberNumber();
+      try {
+        const result = await pool.query(
+          `INSERT INTO users (member_number, full_name, username, phone, password_hash)
+           VALUES ($1, $2, $3, $4, $5) RETURNING *`,
+          [memberNumber, fullName.trim(), username.trim(), phone || null, passwordHash]
         );
+        inserted = result.rows[0];
+        break;
+      } catch (e) {
+        if (e.code === '23505' && e.constraint && e.constraint.includes('member_number')) {
+          attempts++; continue;
+        }
+        throw e;
+      }
+    }
+    if (!inserted) {
+      return res.status(500).json({ success: false, code: 'MEMBER_NUMBER_COLLISION', message: 'تعذر إنشاء رقم عضوية' });
     }
 
-    let text = `👥 *الأعضاء* (${total} إجمالي)\n`;
-    text += `📄 الصفحة ${page + 1} من ${Math.ceil(total / limit)}\n\n`;
-
-    for (const u of listResult.rows) {
-        const verifiedMark = u.is_verified ? '✅' : '⏳';
-        const adminMark = u.is_admin ? ' 👑' : '';
-        const statusMark = u.status === 'suspended' ? ' 🚫' : (u.status === 'active' ? ' 🟢' : ' ⚪');
-        text += `${verifiedMark}${adminMark}${statusMark} *${escapeMd(u.full_name)}*\n`;
-        text += `   @${escapeMd(u.username)} | \`${u.member_number}\`\n`;
-        text += `   💰 ${formatNumber(u.balance_points)} | ID: \`${u.id}\`\n\n`;
+    if (ADMIN_USERNAMES.includes(inserted.username)) {
+      await pool.query('UPDATE users SET is_admin = TRUE WHERE id = $1', [inserted.id]);
+      inserted.is_admin = true;
     }
 
-    const navButtons = [];
-    if (page > 0) navButtons.push(Markup.button.callback('⬅️ السابق', `users_${filter}_${page - 1}${searchQuery ? '_' + searchQuery : ''}`));
-    if (offset + limit < total) navButtons.push(Markup.button.callback('➡️ التالي', `users_${filter}_${page + 1}${searchQuery ? '_' + searchQuery : ''}`));
-
-    const buttons = [];
-    if (navButtons.length > 0) buttons.push(navButtons);
-    buttons.push([Markup.button.callback('🔙 رجوع', 'users_menu')]);
-    buttons.push([Markup.button.callback('🏠 الرئيسية', 'main')]);
-
-    await safeEdit(ctx, text, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) });
-}
-
-bot.action(/^users_list_(\d+)$/, async (ctx) => {
-    await ctx.answerCbQuery();
-    await showUsersList(ctx, 'all', Number(ctx.match[1]));
+    const token = issueToken(inserted);
+    res.status(201).json({ success: true, data: { token, user: publicUser(inserted) } });
+  } catch (e) { next(e); }
 });
 
-bot.action(/^users_verified_(\d+)$/, async (ctx) => {
-    await ctx.answerCbQuery();
-    await showUsersList(ctx, 'verified', Number(ctx.match[1]));
+app.post('/api/auth/login', async (req, res, next) => {
+  try {
+    const { username, password } = req.body || {};
+    if (!username || !password) {
+      return res.status(400).json({ success: false, code: 'MISSING_FIELDS', message: 'اسم المستخدم وكلمة المرور مطلوبان' });
+    }
+
+    const key = String(username).toLowerCase();
+    if (!checkRateLimit(key)) {
+      return res.status(429).json({ success: false, code: 'TOO_MANY_ATTEMPTS', message: 'محاولات كثيرة. حاول لاحقًا' });
+    }
+
+    const result = await pool.query('SELECT * FROM users WHERE username = $1', [username]);
+    if (result.rowCount === 0) {
+      return res.status(401).json({ success: false, code: 'INVALID_CREDENTIALS', message: 'بيانات الدخول غير صحيحة' });
+    }
+    const user = result.rows[0];
+    const ok = await bcrypt.compare(password, user.password_hash);
+    if (!ok) {
+      return res.status(401).json({ success: false, code: 'INVALID_CREDENTIALS', message: 'بيانات الدخول غير صحيحة' });
+    }
+    if (user.status !== 'active') {
+      return res.status(403).json({ success: false, code: 'ACCOUNT_NOT_ACTIVE', message: 'الحساب غير نشط' });
+    }
+    loginAttempts.delete(key);
+
+    const token = issueToken(user);
+    res.json({ success: true, data: { token, user: publicUser(user) } });
+  } catch (e) { next(e); }
 });
 
-bot.action(/^users_unverified_(\d+)$/, async (ctx) => {
-    await ctx.answerCbQuery();
-    await showUsersList(ctx, 'unverified', Number(ctx.match[1]));
-});
+// ---------- تغيير كلمة المرور ----------
+app.post('/api/account/change-password', authRequired, async (req, res, next) => {
+  try {
+    const { currentPassword, newPassword } = req.body || {};
 
-bot.action(/^users_suspended_(\d+)$/, async (ctx) => {
-    await ctx.answerCbQuery();
-    await showUsersList(ctx, 'suspended', Number(ctx.match[1]));
-});
+    if (!currentPassword || !newPassword) {
+      return res.status(400).json({ 
+        success: false, 
+        code: 'MISSING_FIELDS', 
+        message: 'كلمة المرور الحالية والجديدة مطلوبتان' 
+      });
+    }
+    if (newPassword.length < 6) {
+      return res.status(400).json({ 
+        success: false, 
+        code: 'WEAK_PASSWORD', 
+        message: 'كلمة المرور الجديدة قصيرة جدًا' 
+      });
+    }
 
-bot.action('users_search', async (ctx) => {
-    await ctx.answerCbQuery();
-    setState(ctx, { step: 'search_user' });
-    await ctx.reply(
-        '🔍 أرسل اسم المستخدم أو رقم العضوية أو الاسم الكامل للبحث:',
-        homeKeyboard()
+    const userR = await pool.query('SELECT password_hash FROM users WHERE id = $1', [req.userId]);
+    if (userR.rowCount === 0) {
+      return res.status(404).json({ success: false, code: 'USER_NOT_FOUND', message: 'المستخدم غير موجود' });
+    }
+
+    const ok = await bcrypt.compare(currentPassword, userR.rows[0].password_hash);
+    if (!ok) {
+      return res.status(401).json({ success: false, code: 'INVALID_PASSWORD', message: 'كلمة المرور الحالية غير صحيحة' });
+    }
+
+    const newHash = await bcrypt.hash(newPassword, 10);
+    await pool.query(
+      'UPDATE users SET password_hash = $1, updated_at = NOW() WHERE id = $2',
+      [newHash, req.userId]
     );
-});
-
-// =====================================
-// عرض تفاصيل عضو
-// =====================================
-
-async function showUserDetails(ctx, userId) {
-    const u = (await pool.query('SELECT * FROM users WHERE id = $1', [userId])).rows[0];
-    if (!u) {
-        return ctx.reply('❌ العضو غير موجود.');
-    }
-
-    const doc = (await pool.query(
-        'SELECT status, rejection_reason FROM documents WHERE user_id = $1 ORDER BY id DESC LIMIT 1',
-        [userId]
-    )).rows[0];
-
-    const txCount = (await pool.query(
-        'SELECT COUNT(*) AS c FROM transactions WHERE sender_user_id = $1 OR receiver_user_id = $1',
-        [userId]
-    )).rows[0].c;
-
-    let text = `👤 *تفاصيل العضو*\n\n`;
-    text += `🆔 *ID:* \`${u.id}\`\n`;
-    text += `👤 *الاسم:* ${escapeMd(u.full_name)}\n`;
-    text += `📛 *اسم المستخدم:* @${escapeMd(u.username)}\n`;
-    text += `🔢 *رقم العضوية:* \`${u.member_number}\`\n`;
-    text += `📱 *الهاتف:* ${u.phone ? escapeMd(u.phone) : '—'}\n`;
-    text += `💰 *الرصيد:* ${formatNumber(u.balance_points)} نقطة\n`;
-    text += `✅ *موثق:* ${u.is_verified ? 'نعم' : 'لا'}\n`;
-    text += `👑 *مشرف:* ${u.is_admin ? 'نعم' : 'لا'}\n`;
-    text += `⚪ *الحالة:* ${u.status}\n`;
-    text += `📅 *تاريخ التسجيل:* ${formatDate(u.created_at)}\n`;
-
-    if (u.national_id) text += `🆔 *الرقم الوطني:* \`${u.national_id}\`\n`;
-    if (u.date_of_birth) text += `🎂 *تاريخ الميلاد:* ${formatDate(u.date_of_birth)}\n`;
-
-    if (doc) {
-        text += `\n📄 *حالة التوثيق:* ${doc.status}\n`;
-        if (doc.rejection_reason) text += `📝 *السبب:* ${escapeMd(doc.rejection_reason)}\n`;
-    }
-
-    text += `\n💸 *عدد المعاملات:* ${formatNumber(txCount)}`;
-
-    const buttons = [
-        [Markup.button.callback('💰 شحن رصيد', `user_credit_${u.id}`),
-         Markup.button.callback('💸 خصم رصيد', `user_debit_${u.id}`)],
-        [Markup.button.callback('🎁 إهداء نقاط', `user_gift_${u.id}`)],
-    ];
-
-    if (u.is_verified) {
-        buttons.push([Markup.button.callback('❌ إلغاء التوثيق', `user_unverify_${u.id}`)]);
-    } else {
-        buttons.push([Markup.button.callback('✅ توثيق يدوياً', `user_verify_${u.id}`)]);
-    }
-
-    if (u.status === 'suspended') {
-        buttons.push([Markup.button.callback('🟢 إلغاء الحظر', `user_activate_${u.id}`)]);
-    } else {
-        buttons.push([Markup.button.callback('🚫 حظر العضو', `user_suspend_${u.id}`)]);
-    }
-
-    buttons.push([Markup.button.callback('🗑️ حذف الحساب', `user_delete_${u.id}`)]);
-    buttons.push([Markup.button.callback('🔙 رجوع', 'users_menu')]);
-
-    await safeEdit(ctx, text, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) });
-}
-
-bot.action(/^user_view_(\d+)$/, async (ctx) => {
-    await ctx.answerCbQuery();
-    await showUserDetails(ctx, Number(ctx.match[1]));
-});
-
-// =====================================
-// الحظر / التنشيط / الحذف
-// =====================================
-
-bot.action(/^user_suspend_(\d+)$/, async (ctx) => {
-    await ctx.answerCbQuery();
-    const userId = Number(ctx.match[1]);
-
-    if (ADMIN_IDS.includes(String(userId))) {
-        return ctx.answerCbQuery('لا يمكن حظر مشرف', { show_alert: true });
-    }
 
     await pool.query(
-        'UPDATE users SET status = $1, updated_at = NOW() WHERE id = $2',
-        ['suspended', userId]
-    );
-    await pool.query(
-        `INSERT INTO audit_logs (actor_user_id, action, target_user_id, metadata)
-         VALUES (NULL, 'bot_suspend', $1, $2)`,
-        [userId, JSON.stringify({ via: 'telegram_bot' })]
+      `INSERT INTO audit_logs (actor_user_id, action, metadata)
+       VALUES ($1, 'change_password', $2)`,
+      [req.userId, JSON.stringify({ via: 'app' })]
     );
 
-    await ctx.answerCbQuery('✅ تم الحظر', { show_alert: true });
-    await showUserDetails(ctx, userId);
+    res.json({ success: true, message: 'تم تغيير كلمة المرور بنجاح' });
+  } catch (e) { next(e); }
 });
 
-bot.action(/^user_activate_(\d+)$/, async (ctx) => {
-    await ctx.answerCbQuery();
-    const userId = Number(ctx.match[1]);
-
-    await pool.query(
-        'UPDATE users SET status = $1, updated_at = NOW() WHERE id = $2',
-        ['active', userId]
-    );
-    await pool.query(
-        `INSERT INTO audit_logs (actor_user_id, action, target_user_id, metadata)
-         VALUES (NULL, 'bot_reactivate', $1, $2)`,
-        [userId, JSON.stringify({ via: 'telegram_bot' })]
-    );
-
-    await ctx.answerCbQuery('✅ تم التنشيط', { show_alert: true });
-    await showUserDetails(ctx, userId);
-});
-
-bot.action(/^user_delete_(\d+)$/, async (ctx) => {
-    await ctx.answerCbQuery();
-    const userId = Number(ctx.match[1]);
-
-    await safeEdit(
-        ctx,
-        `⚠️ *تأكيد الحذف*\n\nهل أنت متأكد من حذف العضو رقم \`${userId}\`؟\n` +
-        `سيتم حذف جميع بياناته ولا يمكن التراجع.`,
-        {
-            parse_mode: 'Markdown',
-            ...Markup.inlineKeyboard([
-                [Markup.button.callback('✅ نعم، احذف', `user_delete_confirm_${userId}`)],
-                [Markup.button.callback('❌ إلغاء', `user_view_${userId}`)]
-            ])
-        }
-    );
-});
-
-bot.action(/^user_delete_confirm_(\d+)$/, async (ctx) => {
-    await ctx.answerCbQuery();
-    const userId = Number(ctx.match[1]);
-
-    try {
-        await pool.query('DELETE FROM users WHERE id = $1', [userId]);
-        await pool.query(
-            `INSERT INTO audit_logs (actor_user_id, action, target_user_id, metadata)
-             VALUES (NULL, 'bot_delete', $1, $2)`,
-            [userId, JSON.stringify({ via: 'telegram_bot' })]
-        );
-        await safeEdit(ctx, `✅ تم حذف العضو رقم \`${userId}\``, {
-            parse_mode: 'Markdown',
-            ...homeKeyboard()
-        });
-    } catch (e) {
-        await ctx.reply('❌ فشل الحذف: ' + e.message);
+// ---------- الحساب ----------
+app.get('/api/account/me', authRequired, async (req, res, next) => {
+  try {
+    const r = await pool.query('SELECT * FROM users WHERE id = $1', [req.userId]);
+    if (r.rowCount === 0) {
+      return res.status(404).json({ success: false, code: 'USER_NOT_FOUND', message: 'المستخدم غير موجود' });
     }
+    res.json({ success: true, data: publicUser(r.rows[0]) });
+  } catch (e) { next(e); }
 });
 
-// =====================================
-// التوثيق اليدوي / الإلغاء
-// =====================================
-
-bot.action(/^user_verify_(\d+)$/, async (ctx) => {
-    await ctx.answerCbQuery();
-    const userId = Number(ctx.match[1]);
-
-    const client = await pool.connect();
-    try {
-        await client.query('BEGIN');
-
-        const userR = await client.query(
-            'SELECT id, username, national_id, date_of_birth, full_name FROM users WHERE id = $1 FOR UPDATE',
-            [userId]
-        );
-
-        if (userR.rowCount === 0) {
-            await client.query('ROLLBACK');
-            return ctx.reply('❌ العضو غير موجود.');
-        }
-
-        const target = userR.rows[0];
-
-        await client.query(
-            'UPDATE users SET is_verified = TRUE, updated_at = NOW() WHERE id = $1',
-            [userId]
-        );
-
-        const existing = await client.query(
-            'SELECT id FROM documents WHERE user_id = $1',
-            [userId]
-        );
-
-        if (existing.rowCount > 0) {
-            await client.query(
-                `UPDATE documents 
-                 SET status = 'approved', reviewed_at = NOW(), rejection_reason = NULL 
-                 WHERE user_id = $1`,
-                [userId]
-            );
-        } else {
-            await client.query(
-                `INSERT INTO documents 
-                 (user_id, national_id, full_name_4, date_of_birth, image_data, status, reviewed_at)
-                 VALUES ($1, $2, $3, $4, NULL, 'approved', NOW())`,
-                [
-                    userId,
-                    target.national_id || '00000000000',
-                    target.full_name || '—',
-                    target.date_of_birth || '2000-01-01'
-                ]
-            );
-        }
-
-        await client.query(
-            `INSERT INTO audit_logs (actor_user_id, action, target_user_id, metadata)
-             VALUES (NULL, 'bot_manual_verify', $1, $2)`,
-            [userId, JSON.stringify({ via: 'telegram_bot' })]
-        );
-
-        await client.query('COMMIT');
-
-        await ctx.answerCbQuery('✅ تم التوثيق اليدوي', { show_alert: true });
-        await showUserDetails(ctx, userId);
-    } catch (e) {
-        await client.query('ROLLBACK');
-        console.error('خطأ:', e.message);
-        await ctx.reply('❌ خطأ: ' + e.message);
-    } finally {
-        client.release();
+app.get('/api/account/balance', authRequired, async (req, res, next) => {
+  try {
+    const r = await pool.query('SELECT balance_points FROM users WHERE id = $1', [req.userId]);
+    if (r.rowCount === 0) {
+      return res.status(404).json({ success: false, code: 'USER_NOT_FOUND', message: 'المستخدم غير موجود' });
     }
+    res.json({ success: true, data: { balancePoints: Number(r.rows[0].balance_points) } });
+  } catch (e) { next(e); }
 });
 
-bot.action(/^user_unverify_(\d+)$/, async (ctx) => {
-    await ctx.answerCbQuery();
-    const userId = Number(ctx.match[1]);
-
-    await safeEdit(
-        ctx,
-        `⚠️ *تأكيد إلغاء التوثيق*\n\n` +
-        `سيتم إلغاء توثيق العضو رقم \`${userId}\`\n` +
-        `وحذف سجل التوثيق. سيتمكن من إرسال طلب توثيق جديد.`,
-        {
-            parse_mode: 'Markdown',
-            ...Markup.inlineKeyboard([
-                [Markup.button.callback('✅ نعم، ألغِ التوثيق', `user_unverify_confirm_${userId}`)],
-                [Markup.button.callback('❌ إلغاء', `user_view_${userId}`)]
-            ])
-        }
-    );
-});
-
-bot.action(/^user_unverify_confirm_(\d+)$/, async (ctx) => {
-    await ctx.answerCbQuery();
-    const userId = Number(ctx.match[1]);
-
-    const client = await pool.connect();
-    try {
-        await client.query('BEGIN');
-
-        await client.query(
-            `UPDATE users 
-             SET is_verified = FALSE, 
-                 national_id = NULL, 
-                 date_of_birth = NULL, 
-                 updated_at = NOW() 
-             WHERE id = $1`,
-            [userId]
-        );
-
-        await client.query('DELETE FROM documents WHERE user_id = $1', [userId]);
-
-        await client.query(
-            `INSERT INTO audit_logs (actor_user_id, action, target_user_id, metadata)
-             VALUES (NULL, 'bot_unverify', $1, $2)`,
-            [userId, JSON.stringify({ via: 'telegram_bot' })]
-        );
-
-        await client.query('COMMIT');
-
-        await ctx.answerCbQuery('✅ تم إلغاء التوثيق', { show_alert: true });
-        await showUserDetails(ctx, userId);
-    } catch (e) {
-        await client.query('ROLLBACK');
-        console.error('خطأ:', e.message);
-        await ctx.reply('❌ خطأ: ' + e.message);
-    } finally {
-        client.release();
+// ---------- البحث عن مستخدم ----------
+app.get('/api/users/lookup', authRequired, async (req, res, next) => {
+  try {
+    const raw = req.query.memberNumber;
+    const memberNumber = normalizeMemberNumber(raw);
+    if (!memberNumber) {
+      return res.status(400).json({ success: false, code: 'INVALID_MEMBER_NUMBER', message: 'رقم العضوية غير صالح' });
     }
-});
-
-// =====================================
-// إدارة الرصيد
-// =====================================
-
-bot.action('balance_menu', async (ctx) => {
-    await ctx.answerCbQuery();
-    resetState(ctx);
-
-    await safeEdit(
-        ctx,
-        '💰 *إدارة الرصيد*\n\n' +
-        'يمكنك تنفيذ العمليات عبر الأوامر النصية:\n\n' +
-        '• `/credit NQ-12345678 100` — شحن رصيد\n' +
-        '• `/debit NQ-12345678 100` — خصم رصيد\n' +
-        '• `/gift NQ-12345678 100` — إهداء نقاط\n\n' +
-        'أو استخدم الأزرار أدناه، ثم اختر العضو.',
-        {
-            parse_mode: 'Markdown',
-            ...Markup.inlineKeyboard([
-                [Markup.button.callback('💰 شحن', 'balance_action_credit')],
-                [Markup.button.callback('💸 خصم', 'balance_action_debit')],
-                [Markup.button.callback('🎁 إهداء', 'balance_action_gift')],
-                [Markup.button.callback('🏠 الرئيسية', 'main')]
-            ])
-        }
-    );
-});
-
-bot.action(/^balance_action_(credit|debit|gift)$/, async (ctx) => {
-    await ctx.answerCbQuery();
-    const action = ctx.match[1];
-
-    setState(ctx, { step: 'balance_select_user', balanceAction: action });
-
-    const actionName = action === 'credit' ? 'الشحن' :
-                       action === 'debit' ? 'الخصم' : 'الإهداء';
-
-    await ctx.reply(
-        `💰 *${actionName}*\n\nأرسل رقم العضوية الآن.\nمثال: \`NQ-12345678\``,
-        { parse_mode: 'Markdown', ...homeKeyboard() }
-    );
-});
-
-bot.action(/^user_(credit|debit|gift)_(\d+)$/, async (ctx) => {
-    await ctx.answerCbQuery();
-    const action = ctx.match[1];
-    const userId = Number(ctx.match[2]);
-
-    const u = (await pool.query('SELECT member_number FROM users WHERE id = $1', [userId])).rows[0];
-    if (!u) return ctx.reply('❌ العضو غير موجود.');
-
-    setState(ctx, { step: 'balance_amount', balanceAction: action, targetUserId: userId });
-
-    const actionName = action === 'credit' ? 'الشحن' :
-                       action === 'debit' ? 'الخصم' : 'الإهداء';
-
-    await ctx.reply(
-        `💰 *${actionName}* للعضو \`${u.member_number}\`\n\n` +
-        `أرسل عدد النقاط الآن (رقم فقط):`,
-        { parse_mode: 'Markdown', ...homeKeyboard() }
-    );
-});
-
-async function executeBalanceAction(ctx, action, userId, amount) {
-    const client = await pool.connect();
-    try {
-        await client.query('BEGIN');
-
-        const uR = await client.query(
-            'SELECT * FROM users WHERE id = $1 FOR UPDATE',
-            [userId]
-        );
-        if (uR.rowCount === 0) {
-            await client.query('ROLLBACK');
-            return ctx.reply('❌ العضو غير موجود.');
-        }
-        const target = uR.rows[0];
-
-        if (action === 'debit' && Number(target.balance_points) < amount) {
-            await client.query('ROLLBACK');
-            return ctx.reply(
-                `❌ الرصيد الحالي (${formatNumber(target.balance_points)}) أقل من المبلغ المطلوب (${formatNumber(amount)}).`
-            );
-        }
-
-        const sign = (action === 'debit') ? -1 : 1;
-
-        await client.query(
-            'UPDATE users SET balance_points = balance_points + $1, updated_at = NOW() WHERE id = $2',
-            [sign * amount, userId]
-        );
-
-        const ref = 'TX-' + Date.now().toString(36).toUpperCase() +
-                    Math.random().toString(16).substring(2, 6).toUpperCase();
-
-        const type = action === 'credit' ? 'admin_credit' :
-                     action === 'debit' ? 'admin_debit' : 'admin_gift';
-
-        const description = action === 'credit' ? 'شحن من الإدارة' :
-                            action === 'debit' ? 'خصم إداري' : 'إهداء من الإدارة';
-
-        if (action === 'debit') {
-            await client.query(
-                `INSERT INTO transactions
-                 (reference_number, type, amount_points, fee_points, sender_user_id, description)
-                 VALUES ($1, $2, $3, 0, $4, $5)`,
-                [ref, type, amount, userId, description]
-            );
-        } else {
-            await client.query(
-                `INSERT INTO transactions
-                 (reference_number, type, amount_points, fee_points, receiver_user_id, description)
-                 VALUES ($1, $2, $3, 0, $4, $5)`,
-                [ref, type, amount, userId, description]
-            );
-        }
-
-        await client.query(
-            `INSERT INTO audit_logs (actor_user_id, action, target_user_id, metadata)
-             VALUES (NULL, $1, $2, $3)`,
-            [`bot_${type}`, userId, JSON.stringify({ amount, ref, via: 'telegram_bot' })]
-        );
-
-        await client.query('COMMIT');
-
-        const newBalance = Number(target.balance_points) + sign * amount;
-        const actionLabel = action === 'credit' ? 'شحن' :
-                            action === 'debit' ? 'خصم' : 'إهداء';
-
-        await ctx.reply(
-            `✅ *تم ${actionLabel} بنجاح*\n\n` +
-            `👤 *العضو:* ${escapeMd(target.full_name)}\n` +
-            `🔢 *رقم العضوية:* \`${target.member_number}\`\n` +
-            `💰 *المبلغ:* ${formatNumber(amount)}\n` +
-            `💵 *الرصيد الجديد:* ${formatNumber(newBalance)}\n` +
-            `🧾 *رقم العملية:* \`${ref}\``,
-            { parse_mode: 'Markdown', ...homeKeyboard() }
-        );
-    } catch (e) {
-        await client.query('ROLLBACK');
-        console.error('خطأ:', e.message);
-        await ctx.reply('❌ حدث خطأ: ' + e.message);
-    } finally {
-        client.release();
-    }
-}
-
-// =====================================
-// الأوامر النصية
-// =====================================
-
-bot.command('gift', async (ctx) => {
-    if (!isAdmin(ctx)) return;
-    const parts = ctx.message.text.split(' ').filter(Boolean);
-    if (parts.length < 3) {
-        return ctx.reply('⚠️ الصيغة: `/gift NQ-12345678 100`', { parse_mode: 'Markdown' });
-    }
-    const memberNumber = normalizeMemberNumber(parts[1]);
-    const amount = parseInt(parts[2], 10);
-    if (!memberNumber || !Number.isInteger(amount) || amount <= 0) {
-        return ctx.reply('❌ رقم العضوية أو المبلغ غير صحيح.');
-    }
-    const u = (await pool.query('SELECT id FROM users WHERE member_number = $1', [memberNumber])).rows[0];
-    if (!u) return ctx.reply('❌ لا يوجد عضو بهذا الرقم.');
-    await executeBalanceAction(ctx, 'gift', u.id, amount);
-});
-
-bot.command('credit', async (ctx) => {
-    if (!isAdmin(ctx)) return;
-    const parts = ctx.message.text.split(' ').filter(Boolean);
-    if (parts.length < 3) {
-        return ctx.reply('⚠️ الصيغة: `/credit NQ-12345678 100`', { parse_mode: 'Markdown' });
-    }
-    const memberNumber = normalizeMemberNumber(parts[1]);
-    const amount = parseInt(parts[2], 10);
-    if (!memberNumber || !Number.isInteger(amount) || amount <= 0) {
-        return ctx.reply('❌ رقم العضوية أو المبلغ غير صحيح.');
-    }
-    const u = (await pool.query('SELECT id FROM users WHERE member_number = $1', [memberNumber])).rows[0];
-    if (!u) return ctx.reply('❌ لا يوجد عضو بهذا الرقم.');
-    await executeBalanceAction(ctx, 'credit', u.id, amount);
-});
-
-bot.command('debit', async (ctx) => {
-    if (!isAdmin(ctx)) return;
-    const parts = ctx.message.text.split(' ').filter(Boolean);
-    if (parts.length < 3) {
-        return ctx.reply('⚠️ الصيغة: `/debit NQ-12345678 100`', { parse_mode: 'Markdown' });
-    }
-    const memberNumber = normalizeMemberNumber(parts[1]);
-    const amount = parseInt(parts[2], 10);
-    if (!memberNumber || !Number.isInteger(amount) || amount <= 0) {
-        return ctx.reply('❌ رقم العضوية أو المبلغ غير صحيح.');
-    }
-    const u = (await pool.query('SELECT id FROM users WHERE member_number = $1', [memberNumber])).rows[0];
-    if (!u) return ctx.reply('❌ لا يوجد عضو بهذا الرقم.');
-    await executeBalanceAction(ctx, 'debit', u.id, amount);
-});
-
-bot.command('find', async (ctx) => {
-    if (!isAdmin(ctx)) return;
-    const parts = ctx.message.text.split(' ').filter(Boolean);
-    if (parts.length < 2) {
-        return ctx.reply('⚠️ الصيغة: `/find NQ-12345678`', { parse_mode: 'Markdown' });
-    }
-    const memberNumber = normalizeMemberNumber(parts[1]);
-    const u = (await pool.query('SELECT id FROM users WHERE member_number = $1', [memberNumber])).rows[0];
-    if (!u) return ctx.reply('❌ لا يوجد عضو بهذا الرقم.');
-    await showUserDetails(ctx, u.id);
-});
-
-// =====================================
-// ✅ طلبات التوثيق (مع التشخيص الكامل للصورة)
-// =====================================
-
-bot.action('pending_docs', async (ctx) => {
-    await ctx.answerCbQuery();
-
-    try {
-        const r = await pool.query(
-            `SELECT d.id, d.national_id, d.full_name_4, d.date_of_birth,
-                    d.image_data, d.created_at,
-                    u.username, u.member_number, u.full_name, u.id AS user_id,
-                    LENGTH(d.image_data) AS image_length
-             FROM documents d
-             JOIN users u ON u.id = d.user_id
-             WHERE d.status = 'pending'
-             ORDER BY d.created_at ASC
-             LIMIT 10`
-        );
-
-        if (r.rowCount === 0) {
-            return ctx.reply('✅ لا توجد طلبات معلقة.', homeKeyboard());
-        }
-
-        await ctx.reply(`📋 *${r.rowCount} طلب معلق:*`, { parse_mode: 'Markdown' });
-
-        for (const doc of r.rows) {
-            // 🔍 تشخيص مفصل
-            console.log('==========================================');
-            console.log(`📄 Document ID: ${doc.id}`);
-            console.log(`👤 User: ${doc.username} (${doc.member_number})`);
-            console.log(`📸 image_data length: ${doc.image_length || 0}`);
-            console.log(`📸 First 60 chars: ${(doc.image_data || '').substring(0, 60)}`);
-
-            const imageSizeKB = doc.image_length ? (doc.image_length / 1024).toFixed(1) : '0';
-            
-            const caption =
-                `👤 *الاسم:* ${escapeMd(doc.full_name_4)}\n` +
-                `🆔 *الرقم الوطني:* \`${doc.national_id}\`\n` +
-                `🎂 *الميلاد:* ${formatDate(doc.date_of_birth)}\n` +
-                `📅 *التقديم:* ${formatDate(doc.created_at)}\n\n` +
-                `👥 *صاحب الحساب:*\n` +
-                `• @${escapeMd(doc.username)}\n` +
-                `• \`${doc.member_number}\`\n` +
-                `• ID: \`${doc.user_id}\`\n\n` +
-                `🖼️ *حجم الصورة:* ${imageSizeKB} KB`;
-
-            const keyboard = Markup.inlineKeyboard([
-                [
-                    Markup.button.callback('✅ قبول', `approve_doc_${doc.id}`),
-                    Markup.button.callback('❌ رفض', `reject_doc_${doc.id}`)
-                ]
-            ]);
-
-            let photoSent = false;
-
-            // محاولة إرسال الصورة
-            if (doc.image_data && doc.image_length > 100) {
-                try {
-                    // تنظيف Base64 بشكل شامل
-                    let base64Data = doc.image_data
-                        .replace(/^data:image\/\w+;base64,/, '')  // إزالة البادئة
-                        .replace(/\s/g, '')                      // إزالة المسافات والأسطر
-                        .replace(/[^A-Za-z0-9+/=]/g, '');       // إزالة أي أحرف غير Base64
-
-                    console.log(`📸 Cleaned base64 length: ${base64Data.length}`);
-
-                    if (base64Data.length > 100) {
-                        const imageBuffer = Buffer.from(base64Data, 'base64');
-                        
-                        console.log(`📸 Buffer size: ${imageBuffer.length} bytes (${(imageBuffer.length / 1024).toFixed(1)} KB)`);
-
-                        // التحقق من الصيغة (Magic Bytes)
-                        const magicBytes = imageBuffer.slice(0, 4);
-                        const isJPEG = magicBytes[0] === 0xFF && magicBytes[1] === 0xD8;
-                        const isPNG = magicBytes[0] === 0x89 && magicBytes[1] === 0x50;
-                        const isWEBP = imageBuffer.slice(8, 12).toString() === 'WEBP';
-
-                        console.log(`📸 Format: JPEG=${isJPEG}, PNG=${isPNG}, WEBP=${isWEBP}`);
-
-                        if (isJPEG || isPNG || isWEBP) {
-                            await ctx.replyWithPhoto(
-                                { source: imageBuffer },
-                                { caption, parse_mode: 'Markdown', ...keyboard }
-                            );
-                            photoSent = true;
-                            console.log(`✅ Photo sent successfully`);
-                        } else {
-                            console.error(`❌ Invalid image format`);
-                        }
-                    }
-                } catch (err) {
-                    console.error(`❌ Photo send error:`, err.message);
-                }
-            } else {
-                console.log(`⚠️ Image is empty or too small`);
-            }
-
-            // إذا فشلت الصورة، أرسل النص فقط
-            if (!photoSent) {
-                await ctx.reply(caption, { parse_mode: 'Markdown', ...keyboard });
-            }
-        }
-
-        await ctx.reply('— انتهى —', homeKeyboard());
-    } catch (e) {
-        console.error('❌ Error:', e.message);
-        await ctx.reply('❌ خطأ: ' + e.message);
-    }
-});
-
-// =====================================
-// الموافقة والرفض
-// =====================================
-
-bot.action(/^approve_doc_(\d+)$/, async (ctx) => {
-    await ctx.answerCbQuery();
-    const docId = Number(ctx.match[1]);
-    const client = await pool.connect();
-
-    try {
-        await client.query('BEGIN');
-        const docR = await client.query(
-            'SELECT * FROM documents WHERE id = $1 AND status = $2 FOR UPDATE',
-            [docId, 'pending']
-        );
-
-        if (docR.rowCount === 0) {
-            await client.query('ROLLBACK');
-            return ctx.reply('⚠️ المستند غير موجود أو تمت مراجعته.');
-        }
-
-        const doc = docR.rows[0];
-
-        await client.query(
-            'UPDATE documents SET status = $1, reviewed_at = NOW() WHERE id = $2',
-            ['approved', docId]
-        );
-        await client.query(
-            `UPDATE users SET is_verified = TRUE, national_id = $1, date_of_birth = $2, updated_at = NOW() WHERE id = $3`,
-            [doc.national_id, doc.date_of_birth, doc.user_id]
-        );
-        await client.query(
-            `INSERT INTO audit_logs (actor_user_id, action, target_user_id, metadata)
-             VALUES (NULL, 'bot_approve_doc', $1, $2)`,
-            [doc.user_id, JSON.stringify({ documentId: docId })]
-        );
-
-        await client.query('COMMIT');
-
-        await ctx.editMessageCaption(
-            `✅ *تم قبول التوثيق*\n\n👤 ${escapeMd(doc.full_name_4)}\n🆔 \`${doc.national_id}\``,
-            { parse_mode: 'Markdown' }
-        ).catch(() => {});
-
-        await ctx.reply('✅ تم التوثيق بنجاح.', homeKeyboard());
-    } catch (e) {
-        await client.query('ROLLBACK');
-        await ctx.reply('❌ خطأ: ' + e.message);
-    } finally {
-        client.release();
-    }
-});
-
-bot.action(/^reject_doc_(\d+)$/, async (ctx) => {
-    await ctx.answerCbQuery();
-    const docId = Number(ctx.match[1]);
-    setState(ctx, { step: 'reject_reason', rejectDocId: docId });
-    await ctx.reply(`✍️ أرسل سبب رفض المستند رقم \`${docId}\`:`, { parse_mode: 'Markdown' });
-});
-
-// =====================================
-// الإحصائيات
-// =====================================
-
-bot.action('stats', async (ctx) => {
-    await ctx.answerCbQuery();
-    await showStats(ctx);
-});
-
-bot.command('stats', async (ctx) => {
-    if (!isAdmin(ctx)) return;
-    await showStats(ctx);
-});
-
-async function showStats(ctx) {
-    try {
-        const totalUsers = (await pool.query('SELECT COUNT(*) AS c FROM users')).rows[0].c;
-        const verified = (await pool.query('SELECT COUNT(*) AS c FROM users WHERE is_verified = TRUE')).rows[0].c;
-        const suspended = (await pool.query("SELECT COUNT(*) AS c FROM users WHERE status = 'suspended'")).rows[0].c;
-        const pending = (await pool.query("SELECT COUNT(*) AS c FROM documents WHERE status = 'pending'")).rows[0].c;
-        const approved = (await pool.query("SELECT COUNT(*) AS c FROM documents WHERE status = 'approved'")).rows[0].c;
-        const rejected = (await pool.query("SELECT COUNT(*) AS c FROM documents WHERE status = 'rejected'")).rows[0].c;
-        const txCount = (await pool.query('SELECT COUNT(*) AS c FROM transactions')).rows[0].c;
-        const totalBalance = (await pool.query('SELECT COALESCE(SUM(balance_points), 0) AS s FROM users')).rows[0].s;
-        const todayTx = (await pool.query("SELECT COUNT(*) AS c FROM transactions WHERE created_at >= NOW() - INTERVAL '24 hours'")).rows[0].c;
-
-        const message =
-            `📊 *إحصائيات النظام*\n\n` +
-            `👥 *المستخدمون:*\n` +
-            `• الإجمالي: ${formatNumber(totalUsers)}\n` +
-            `• الموثقون: ${formatNumber(verified)}\n` +
-            `• المحظورون: ${formatNumber(suspended)}\n\n` +
-            `📄 *التوثيق:*\n` +
-            `• معلقة: ${formatNumber(pending)}\n` +
-            `• مقبولة: ${formatNumber(approved)}\n` +
-            `• مرفوضة: ${formatNumber(rejected)}\n\n` +
-            `💸 *المعاملات:*\n` +
-            `• الإجمالي: ${formatNumber(txCount)}\n` +
-            `• آخر 24 ساعة: ${formatNumber(todayTx)}\n\n` +
-            `💰 *إجمالي النقاط:* ${formatNumber(totalBalance)}`;
-
-        await safeEdit(ctx, message, { parse_mode: 'Markdown', ...homeKeyboard() });
-    } catch (e) {
-        await ctx.reply('❌ خطأ: ' + e.message);
-    }
-}
-
-// =====================================
-// آخر المعاملات
-// =====================================
-
-bot.action('recent_tx', async (ctx) => {
-    await ctx.answerCbQuery();
 
     const r = await pool.query(
-        `SELECT t.*,
-                s.full_name AS sender_name, s.member_number AS sender_member,
-                r.full_name AS receiver_name, r.member_number AS receiver_member
-         FROM transactions t
-         LEFT JOIN users s ON s.id = t.sender_user_id
-         LEFT JOIN users r ON r.id = t.receiver_user_id
-         ORDER BY t.created_at DESC
-         LIMIT 10`
+      'SELECT id, full_name, member_number, is_verified, status FROM users WHERE member_number = $1',
+      [memberNumber]
+    );
+    if (r.rowCount === 0) {
+      return res.status(404).json({ success: false, code: 'USER_NOT_FOUND', message: 'المستخدم غير موجود' });
+    }
+    const user = r.rows[0];
+    res.json({
+      success: true,
+      data: {
+        memberNumber: user.member_number,
+        name: user.full_name,
+        isVerified: !!user.is_verified,
+        isActive: user.status === 'active'
+      }
+    });
+  } catch (e) { next(e); }
+});
+
+// ---------- معاينة التحويل ----------
+app.post('/api/transfers/preview', authRequired, async (req, res, next) => {
+  try {
+    const { receiverMemberNumber, amountPoints } = req.body || {};
+    const memberNumber = normalizeMemberNumber(receiverMemberNumber);
+    const amount = parsePositiveInt(amountPoints);
+
+    if (!memberNumber) {
+      return res.status(400).json({ success: false, code: 'INVALID_MEMBER_NUMBER', message: 'رقم العضوية غير صالح' });
+    }
+    if (!amount) {
+      return res.status(400).json({ success: false, code: 'INVALID_AMOUNT', message: 'المبلغ يجب أن يكون عددًا صحيحًا أكبر من صفر' });
+    }
+
+    const senderR = await pool.query('SELECT * FROM users WHERE id = $1', [req.userId]);
+    if (senderR.rowCount === 0) {
+      return res.status(404).json({ success: false, code: 'SENDER_NOT_FOUND', message: 'حسابك غير موجود' });
+    }
+    const sender = senderR.rows[0];
+
+    const recR = await pool.query('SELECT * FROM users WHERE member_number = $1', [memberNumber]);
+    if (recR.rowCount === 0) {
+      return res.status(404).json({ success: false, code: 'RECEIVER_NOT_FOUND', message: 'المستلم غير موجود' });
+    }
+    const receiver = recR.rows[0];
+
+    if (receiver.id === sender.id) {
+      return res.status(400).json({ success: false, code: 'SELF_TRANSFER', message: 'لا يمكن التحويل لنفسك' });
+    }
+
+    const total = amount + TRANSFER_FEE;
+    const sufficient = Number(sender.balance_points) >= total;
+    const senderVerified = !!sender.is_verified;
+    const receiverVerified = !!receiver.is_verified;
+    const receiverActive = receiver.status === 'active';
+
+    res.json({
+      success: true,
+      data: {
+        receiverName: receiver.full_name,
+        receiverMemberNumber: receiver.member_number,
+        receiverVerified,
+        receiverActive,
+        amount,
+        fee: TRANSFER_FEE,
+        totalDebit: total,
+        currentBalance: Number(sender.balance_points),
+        newBalance: sufficient ? Number(sender.balance_points) - total : Number(sender.balance_points),
+        canProceed: senderVerified && receiverVerified && receiverActive && sufficient
+      }
+    });
+  } catch (e) { next(e); }
+});
+
+// ---------- التحويلات ----------
+app.post('/api/transfers', authRequired, async (req, res, next) => {
+  const { receiverMemberNumber, amountPoints, note, idempotencyKey } = req.body || {};
+
+  const memberNumber = normalizeMemberNumber(receiverMemberNumber);
+  const amount = parsePositiveInt(amountPoints);
+
+  if (!memberNumber) {
+    return res.status(400).json({ success: false, code: 'INVALID_MEMBER_NUMBER', message: 'رقم العضوية غير صالح' });
+  }
+  if (!amount) {
+    return res.status(400).json({ success: false, code: 'INVALID_AMOUNT', message: 'المبلغ يجب أن يكون عددًا صحيحًا أكبر من صفر' });
+  }
+  if (idempotencyKey && String(idempotencyKey).length > 64) {
+    return res.status(400).json({ success: false, code: 'INVALID_IDEMPOTENCY', message: 'مفتاح منع التكرار طويل جدًا' });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const senderR = await client.query(
+      'SELECT * FROM users WHERE id = $1 FOR UPDATE',
+      [req.userId]
+    );
+    if (senderR.rowCount === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ success: false, code: 'SENDER_NOT_FOUND', message: 'حساب المرسل غير موجود' });
+    }
+    const sender = senderR.rows[0];
+
+    if (!sender.is_verified) {
+      await client.query('ROLLBACK');
+      return res.status(403).json({ success: false, code: 'NOT_VERIFIED', message: 'يجب توثيق حسابك قبل التحويل' });
+    }
+
+    if (sender.status !== 'active') {
+      await client.query('ROLLBACK');
+      return res.status(403).json({ success: false, code: 'ACCOUNT_NOT_ACTIVE', message: 'حسابك غير نشط' });
+    }
+
+    if (idempotencyKey) {
+      const dup = await client.query(
+        'SELECT * FROM transactions WHERE idempotency_key = $1',
+        [idempotencyKey]
+      );
+      if (dup.rowCount > 0) {
+        const existing = dup.rows[0];
+        await client.query('ROLLBACK');
+        return res.json({
+          success: true,
+          data: {
+            referenceNumber: existing.reference_number,
+            amount: Number(existing.amount_points),
+            fee: Number(existing.fee_points),
+            totalDebited: Number(existing.amount_points) + Number(existing.fee_points),
+            newBalance: Number(sender.balance_points),
+            duplicate: true
+          }
+        });
+      }
+    }
+
+    const recR = await client.query(
+      'SELECT * FROM users WHERE member_number = $1 FOR UPDATE',
+      [memberNumber]
+    );
+    if (recR.rowCount === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ success: false, code: 'RECEIVER_NOT_FOUND', message: 'المستلم غير موجود' });
+    }
+    const receiver = recR.rows[0];
+
+    if (receiver.id === sender.id) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ success: false, code: 'SELF_TRANSFER', message: 'لا يمكن التحويل لنفسك' });
+    }
+    if (receiver.status !== 'active') {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ success: false, code: 'RECEIVER_NOT_ACTIVE', message: 'حساب المستلم غير نشط' });
+    }
+    if (!receiver.is_verified) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ success: false, code: 'RECEIVER_NOT_VERIFIED', message: 'المستلم غير موثّق' });
+    }
+
+    const total = amount + TRANSFER_FEE;
+    if (Number(sender.balance_points) < total) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({
+        success: false,
+        code: 'INSUFFICIENT_BALANCE',
+        message: `رصيدك غير كافٍ. المطلوب: ${total} (${amount} + ${TRANSFER_FEE} رسوم)`
+      });
+    }
+
+    await client.query(
+      'UPDATE users SET balance_points = balance_points - $1, updated_at = NOW() WHERE id = $2',
+      [total, sender.id]
+    );
+    await client.query(
+      'UPDATE users SET balance_points = balance_points + $1, updated_at = NOW() WHERE id = $2',
+      [amount, receiver.id]
+    );
+
+    const ref = generateReference();
+    await client.query(
+      `INSERT INTO transactions
+       (reference_number, type, amount_points, fee_points,
+        sender_user_id, receiver_user_id, initiated_by, description, idempotency_key)
+       VALUES ($1, 'transfer', $2, $3, $4, $5, $6, $7, $8)`,
+      [ref, amount, TRANSFER_FEE, sender.id, receiver.id, sender.id, note || null, idempotencyKey || null]
+    );
+
+    await client.query('COMMIT');
+
+    const newBalance = Number(sender.balance_points) - total;
+    res.json({
+      success: true,
+      data: {
+        referenceNumber: ref,
+        amount,
+        fee: TRANSFER_FEE,
+        totalDebited: total,
+        newBalance,
+        receiverName: receiver.full_name,
+        receiverMemberNumber: receiver.member_number
+      }
+    });
+  } catch (e) {
+    await client.query('ROLLBACK');
+    next(e);
+  } finally {
+    client.release();
+  }
+});
+
+// ---------- سجل العمليات ----------
+app.get('/api/transactions', authRequired, async (req, res, next) => {
+  try {
+    const limit = Math.min(parseInt(req.query.limit, 10) || 20, 100);
+    const offset = Math.max(parseInt(req.query.offset, 10) || 0, 0);
+
+    const r = await pool.query(
+      `SELECT t.*,
+              s.full_name AS sender_name, s.member_number AS sender_member,
+              r.full_name AS receiver_name, r.member_number AS receiver_member
+       FROM transactions t
+       LEFT JOIN users s ON s.id = t.sender_user_id
+       LEFT JOIN users r ON r.id = t.receiver_user_id
+       WHERE t.sender_user_id = $1 OR t.receiver_user_id = $1
+       ORDER BY t.created_at DESC
+       LIMIT $2 OFFSET $3`,
+      [req.userId, limit, offset]
+    );
+
+    const items = r.rows.map(row => {
+      const isSender = Number(row.sender_user_id) === Number(req.userId);
+      const incoming = Number(row.receiver_user_id) === Number(req.userId);
+      return {
+        id: Number(row.id),
+        referenceNumber: row.reference_number,
+        type: row.type,
+        status: row.status,
+        amountPoints: Number(row.amount_points),
+        feePoints: Number(row.fee_points),
+        direction: incoming ? 'in' : (isSender ? 'out' : 'other'),
+        description: row.description,
+        counterparty: incoming
+          ? { name: row.sender_name, memberNumber: row.sender_member }
+          : (isSender ? { name: row.receiver_name, memberNumber: row.receiver_member } : null),
+        createdAt: row.created_at
+      };
+    });
+
+    res.json({ success: true, data: { items, limit, offset } });
+  } catch (e) { next(e); }
+});
+
+app.get('/api/transactions/:id', authRequired, async (req, res, next) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isFinite(id)) {
+      return res.status(400).json({ success: false, code: 'INVALID_ID', message: 'معرف غير صالح' });
+    }
+
+    const r = await pool.query(
+      `SELECT t.*,
+              s.full_name AS sender_name, s.member_number AS sender_member,
+              r.full_name AS receiver_name, r.member_number AS receiver_member
+       FROM transactions t
+       LEFT JOIN users s ON s.id = t.sender_user_id
+       LEFT JOIN users r ON r.id = t.receiver_user_id
+       WHERE t.id = $1 AND (t.sender_user_id = $2 OR t.receiver_user_id = $2)`,
+      [id, req.userId]
+    );
+    if (r.rowCount === 0) {
+      return res.status(404).json({ success: false, code: 'TX_NOT_FOUND', message: 'العملية غير موجودة' });
+    }
+    res.json({ success: true, data: r.rows[0] });
+  } catch (e) { next(e); }
+});
+
+// ==========================================
+// ✅✅✅ مسارات التوثيق (جديدة) ✅✅✅
+// ==========================================
+
+// رفع مستند التوثيق
+app.post('/api/documents/upload', authRequired, async (req, res, next) => {
+  const { nationalId, fullName4, dateOfBirth, imageBase64 } = req.body || {};
+
+  console.log('📥 Received document upload request');
+  console.log('   nationalId:', nationalId);
+  console.log('   fullName4:', fullName4);
+  console.log('   dateOfBirth:', dateOfBirth);
+  console.log('   imageBase64 length:', imageBase64 ? imageBase64.length : 0);
+  console.log('   imageBase64 first 50:', imageBase64 ? imageBase64.substring(0, 50) : 'NULL');
+
+  if (!nationalId || !fullName4 || !dateOfBirth || !imageBase64) {
+    return res.status(400).json({ 
+      success: false, 
+      code: 'MISSING_FIELDS', 
+      message: 'جميع الحقول مطلوبة (الرقم الوطني، الاسم، تاريخ الميلاد، الصورة)' 
+    });
+  }
+
+  const cleanId = String(nationalId).replace(/\D/g, '');
+  if (cleanId.length !== 11) {
+    return res.status(400).json({ 
+      success: false, 
+      code: 'INVALID_NATIONAL_ID', 
+      message: 'الرقم الوطني يجب أن يتكون من 11 رقمًا' 
+    });
+  }
+
+  // التحقق من حجم الصورة (Base64)
+  if (imageBase64.length > 3 * 1024 * 1024) {
+    return res.status(413).json({ 
+      success: false, 
+      code: 'IMAGE_TOO_LARGE', 
+      message: 'حجم الصورة كبير جدًا (الحد الأقصى ~2MB)' 
+    });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    // 1. تحقق إذا كان المستخدم موثقاً بالفعل
+    const userCheck = await client.query(
+      'SELECT is_verified FROM users WHERE id = $1 FOR UPDATE',
+      [req.userId]
+    );
+
+    if (userCheck.rowCount === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ 
+        success: false, 
+        code: 'USER_NOT_FOUND', 
+        message: 'المستخدم غير موجود' 
+      });
+    }
+
+    if (userCheck.rows[0].is_verified) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ 
+        success: false, 
+        code: 'ALREADY_VERIFIED', 
+        message: 'حسابك موثق بالفعل. تواصل مع الإدارة إذا كنت بحاجة لإلغاء التوثيق.' 
+      });
+    }
+
+    // 2. ابحث عن أي طلب سابق لهذا المستخدم
+    const existing = await client.query(
+      'SELECT id, status FROM documents WHERE user_id = $1 FOR UPDATE',
+      [req.userId]
+    );
+
+    if (existing.rowCount > 0) {
+      // تحديث الطلب القديم
+      await client.query(
+        `UPDATE documents 
+         SET national_id = $1, 
+             full_name_4 = $2, 
+             date_of_birth = $3, 
+             image_data = $4, 
+             status = 'pending', 
+             rejection_reason = NULL, 
+             reviewed_at = NULL,
+             reviewed_by = NULL,
+             created_at = NOW()
+         WHERE id = $5`,
+        [cleanId, fullName4, dateOfBirth, imageBase64, existing.rows[0].id]
+      );
+      console.log('✅ Document updated, id:', existing.rows[0].id);
+    } else {
+      // طلب جديد
+      const insertResult = await client.query(
+        `INSERT INTO documents (user_id, national_id, full_name_4, date_of_birth, image_data, status)
+         VALUES ($1, $2, $3, $4, $5, 'pending')
+         RETURNING id`,
+        [req.userId, cleanId, fullName4, dateOfBirth, imageBase64]
+      );
+      console.log('✅ Document created, id:', insertResult.rows[0].id);
+    }
+
+    await client.query(
+      `INSERT INTO audit_logs (actor_user_id, action, metadata)
+       VALUES ($1, 'document_upload', $2)`,
+      [req.userId, JSON.stringify({ nationalId: cleanId, imageSize: imageBase64.length })]
+    );
+
+    await client.query('COMMIT');
+
+    res.json({ 
+      success: true, 
+      message: 'تم إرسال مستند التوثيق بنجاح، وهو الآن قيد المراجعة' 
+    });
+
+  } catch (e) {
+    await client.query('ROLLBACK');
+    console.error('❌ Document upload error:', e.message);
+    next(e);
+  } finally {
+    client.release();
+  }
+});
+
+// جلب حالة التوثيق
+app.get('/api/documents/status', authRequired, async (req, res, next) => {
+  try {
+    const r = await pool.query(
+      'SELECT status, rejection_reason, created_at FROM documents WHERE user_id = $1',
+      [req.userId]
     );
 
     if (r.rowCount === 0) {
-        return safeEdit(ctx, '📭 لا توجد معاملات.', { parse_mode: 'Markdown', ...homeKeyboard() });
+      return res.json({ success: true, data: null });
     }
 
-    let text = `💸 *آخر ${r.rowCount} معاملات:*\n\n`;
-
-    for (const t of r.rows) {
-        text += `🧾 \`${t.reference_number}\`\n`;
-        text += `   النوع: ${t.type} | ${formatNumber(t.amount_points)} نقطة\n`;
-        if (t.sender_name) text += `   من: ${escapeMd(t.sender_name)}\n`;
-        if (t.receiver_name) text += `   إلى: ${escapeMd(t.receiver_name)}\n`;
-        text += `   📅 ${formatDateTime(t.created_at)}\n\n`;
-    }
-
-    await safeEdit(ctx, text, { parse_mode: 'Markdown', ...homeKeyboard() });
+    const doc = r.rows[0];
+    res.json({
+      success: true,
+      data: {
+        status: doc.status,
+        rejectionReason: doc.rejection_reason,
+        submittedAt: doc.created_at
+      }
+    });
+  } catch (e) {
+    next(e);
+  }
 });
 
-// =====================================
-// استقبال الرسائل النصية
-// =====================================
+// ==========================================
+// مسارات الأدمن - التوثيق
+// ==========================================
 
-bot.on('text', async (ctx) => {
-    if (!isAdmin(ctx)) return;
-    const text = ctx.message.text;
-    if (text.startsWith('/')) return;
+app.get('/api/admin/documents/pending', authRequired, adminRequired, async (req, res, next) => {
+  try {
+    const r = await pool.query(
+      `SELECT d.id, d.national_id, d.full_name_4, d.date_of_birth, d.image_data, d.created_at,
+              u.username, u.member_number, u.full_name, u.id AS user_id
+       FROM documents d
+       JOIN users u ON u.id = d.user_id
+       WHERE d.status = 'pending'
+       ORDER BY d.created_at ASC`
+    );
+    res.json({ success: true, data: r.rows });
+  } catch (e) {
+    next(e);
+  }
+});
 
-    const state = getState(ctx);
+app.post('/api/admin/documents/:id/approve', authRequired, adminRequired, async (req, res, next) => {
+  const docId = parseInt(req.params.id, 10);
+  if (!Number.isFinite(docId)) {
+    return res.status(400).json({ success: false, code: 'INVALID_ID', message: 'معرف غير صالح' });
+  }
 
-    // سبب رفض التوثيق
-    if (state.step === 'reject_reason' && state.rejectDocId) {
-        const reason = text.trim();
-        if (!reason) return ctx.reply('⚠️ أرسل سبباً.');
-        const docId = state.rejectDocId;
-        setState(ctx, { step: 'main', rejectDocId: null });
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
 
-        const client = await pool.connect();
-        try {
-            await client.query('BEGIN');
-            const docR = await client.query(
-                'SELECT * FROM documents WHERE id = $1 AND status = $2 FOR UPDATE',
-                [docId, 'pending']
-            );
-            if (docR.rowCount === 0) {
-                await client.query('ROLLBACK');
-                return ctx.reply('⚠️ المستند غير موجود.');
-            }
-            const doc = docR.rows[0];
-            await client.query(
-                'UPDATE documents SET status = $1, reviewed_at = NOW(), rejection_reason = $2 WHERE id = $3',
-                ['rejected', reason, docId]
-            );
-            await client.query(
-                'UPDATE users SET is_verified = FALSE, updated_at = NOW() WHERE id = $1',
-                [doc.user_id]
-            );
-            await client.query(
-                `INSERT INTO audit_logs (actor_user_id, action, target_user_id, metadata)
-                 VALUES (NULL, 'bot_reject_doc', $1, $2)`,
-                [doc.user_id, JSON.stringify({ documentId: docId, reason })]
-            );
-            await client.query('COMMIT');
-            await ctx.reply(
-                `❌ *تم الرفض*\n\n👤 ${escapeMd(doc.full_name_4)}\n📝 السبب: ${escapeMd(reason)}`,
-                { parse_mode: 'Markdown', ...homeKeyboard() }
-            );
-        } catch (e) {
-            await client.query('ROLLBACK');
-            await ctx.reply('❌ خطأ: ' + e.message);
-        } finally {
-            client.release();
-        }
-        return;
+    const docR = await client.query(
+      'SELECT * FROM documents WHERE id = $1 AND status = $2 FOR UPDATE',
+      [docId, 'pending']
+    );
+
+    if (docR.rowCount === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ success: false, code: 'DOC_NOT_FOUND', message: 'المستند غير موجود أو تمت مراجعته' });
     }
 
-    // البحث عن عضو
-    if (state.step === 'search_user') {
-        setState(ctx, { step: 'main' });
-        const r = await pool.query(
-            `SELECT id, username, full_name, member_number, balance_points, is_verified, status
-             FROM users
-             WHERE username ILIKE $1 OR full_name ILIKE $1 OR member_number ILIKE $1
-             LIMIT 10`,
-            ['%' + text.trim() + '%']
+    const doc = docR.rows[0];
+
+    await client.query(
+      'UPDATE documents SET status = $1, reviewed_by = $2, reviewed_at = NOW() WHERE id = $3',
+      ['approved', req.userId, docId]
+    );
+
+    await client.query(
+      `UPDATE users 
+       SET is_verified = TRUE, national_id = $1, date_of_birth = $2, updated_at = NOW()
+       WHERE id = $3`,
+      [doc.national_id, doc.date_of_birth, doc.user_id]
+    );
+
+    await client.query(
+      `INSERT INTO audit_logs (actor_user_id, action, target_user_id, metadata)
+       VALUES ($1, 'document_approve', $2, $3)`,
+      [req.userId, doc.user_id, JSON.stringify({ documentId: docId })]
+    );
+
+    await client.query('COMMIT');
+    res.json({ success: true, message: 'تم توثيق المستخدم بنجاح' });
+
+  } catch (e) {
+    await client.query('ROLLBACK');
+    next(e);
+  } finally {
+    client.release();
+  }
+});
+
+app.post('/api/admin/documents/:id/reject', authRequired, adminRequired, async (req, res, next) => {
+  const docId = parseInt(req.params.id, 10);
+  const { reason } = req.body || {};
+
+  if (!Number.isFinite(docId)) {
+    return res.status(400).json({ success: false, code: 'INVALID_ID', message: 'معرف غير صالح' });
+  }
+  if (!reason || reason.trim().length === 0) {
+    return res.status(400).json({ success: false, code: 'MISSING_REASON', message: 'سبب الرفض مطلوب' });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const docR = await client.query(
+      'SELECT * FROM documents WHERE id = $1 AND status = $2 FOR UPDATE',
+      [docId, 'pending']
+    );
+
+    if (docR.rowCount === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ success: false, code: 'DOC_NOT_FOUND', message: 'المستند غير موجود أو تمت مراجعته' });
+    }
+
+    const doc = docR.rows[0];
+
+    await client.query(
+      'UPDATE documents SET status = $1, reviewed_by = $2, reviewed_at = NOW(), rejection_reason = $3 WHERE id = $4',
+      ['rejected', req.userId, reason.trim(), docId]
+    );
+
+    await client.query(
+      'UPDATE users SET is_verified = FALSE, updated_at = NOW() WHERE id = $1',
+      [doc.user_id]
+    );
+
+    await client.query(
+      `INSERT INTO audit_logs (actor_user_id, action, target_user_id, metadata)
+       VALUES ($1, 'document_reject', $2, $3)`,
+      [req.userId, doc.user_id, JSON.stringify({ documentId: docId, reason: reason.trim() })]
+    );
+
+    await client.query('COMMIT');
+    res.json({ success: true, message: 'تم رفض المستند' });
+
+  } catch (e) {
+    await client.query('ROLLBACK');
+    next(e);
+  } finally {
+    client.release();
+  }
+});
+
+// إلغاء توثيق مستخدم
+app.post('/api/admin/users/:id/unverify', authRequired, adminRequired, async (req, res, next) => {
+  const userId = parseInt(req.params.id, 10);
+  if (!Number.isFinite(userId)) {
+    return res.status(400).json({ success: false, code: 'INVALID_ID', message: 'معرف غير صالح' });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const userR = await client.query(
+      'SELECT id, is_verified, username FROM users WHERE id = $1 FOR UPDATE',
+      [userId]
+    );
+
+    if (userR.rowCount === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ success: false, code: 'USER_NOT_FOUND', message: 'المستخدم غير موجود' });
+    }
+
+    await client.query(
+      `UPDATE users 
+       SET is_verified = FALSE, 
+           national_id = NULL, 
+           date_of_birth = NULL, 
+           updated_at = NOW() 
+       WHERE id = $1`,
+      [userId]
+    );
+
+    await client.query('DELETE FROM documents WHERE user_id = $1', [userId]);
+
+    await client.query(
+      `INSERT INTO audit_logs (actor_user_id, action, target_user_id, metadata)
+       VALUES ($1, 'admin_unverify', $2, $3)`,
+      [req.userId, userId, JSON.stringify({ via: 'admin' })]
+    );
+
+    await client.query('COMMIT');
+
+    res.json({ 
+      success: true, 
+      message: 'تم إلغاء توثيق المستخدم بنجاح. يمكنه الآن إرسال طلب توثيق جديد.' 
+    });
+
+  } catch (e) {
+    await client.query('ROLLBACK');
+    next(e);
+  } finally {
+    client.release();
+  }
+});
+
+// ---------- الأدمن: الشحن والخصم ----------
+app.post('/api/admin/credit', authRequired, adminRequired, async (req, res, next) => {
+  const { memberNumber, amountPoints, reason } = req.body || {};
+  const normalized = normalizeMemberNumber(memberNumber);
+  const amount = parsePositiveInt(amountPoints);
+
+  if (!normalized || !amount) {
+    return res.status(400).json({ success: false, code: 'INVALID_INPUT', message: 'رقم العضوية والمبلغ الصحيح مطلوبان' });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const uR = await client.query(
+      'SELECT * FROM users WHERE member_number = $1 FOR UPDATE',
+      [normalized]
+    );
+    if (uR.rowCount === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ success: false, code: 'USER_NOT_FOUND', message: 'المستخدم غير موجود' });
+    }
+    const target = uR.rows[0];
+
+    await client.query(
+      'UPDATE users SET balance_points = balance_points + $1, updated_at = NOW() WHERE id = $2',
+      [amount, target.id]
+    );
+
+    const ref = generateReference();
+    await client.query(
+      `INSERT INTO transactions
+       (reference_number, type, amount_points, fee_points,
+        receiver_user_id, initiated_by, description)
+       VALUES ($1, 'admin_credit', $2, 0, $3, $4, $5)`,
+      [ref, amount, target.id, req.userId, reason || 'شحن من الإدارة']
+    );
+
+    await client.query(
+      `INSERT INTO audit_logs (actor_user_id, action, target_user_id, metadata)
+       VALUES ($1, 'credit', $2, $3)`,
+      [req.userId, target.id, JSON.stringify({ amount, reason })]
+    );
+
+    await client.query('COMMIT');
+
+    const newBalance = Number(target.balance_points) + amount;
+    res.json({
+      success: true,
+      data: {
+        referenceNumber: ref,
+        targetMemberNumber: target.member_number,
+        targetName: target.full_name,
+        amount,
+        newBalance
+      }
+    });
+  } catch (e) {
+    await client.query('ROLLBACK');
+    next(e);
+  } finally {
+    client.release();
+  }
+});
+
+app.post('/api/admin/debit', authRequired, adminRequired, async (req, res, next) => {
+  const { memberNumber, amountPoints, reason } = req.body || {};
+  const normalized = normalizeMemberNumber(memberNumber);
+  const amount = parsePositiveInt(amountPoints);
+
+  if (!normalized || !amount) {
+    return res.status(400).json({ success: false, code: 'INVALID_INPUT', message: 'رقم العضوية والمبلغ الصحيح مطلوبان' });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+
+    const uR = await client.query(
+      'SELECT * FROM users WHERE member_number = $1 FOR UPDATE',
+      [normalized]
+    );
+    if (uR.rowCount === 0) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ success: false, code: 'USER_NOT_FOUND', message: 'المستخدم غير موجود' });
+    }
+    const target = uR.rows[0];
+
+    if (Number(target.balance_points) < amount) {
+      await client.query('ROLLBACK');
+      return res.status(400).json({
+        success: false,
+        code: 'INSUFFICIENT_BALANCE',
+        message: 'رصيد المستخدم أقل من المبلغ المطلوب خصمه'
+      });
+    }
+
+    await client.query(
+      'UPDATE users SET balance_points = balance_points - $1, updated_at = NOW() WHERE id = $2',
+      [amount, target.id]
+    );
+
+    const ref = generateReference();
+    await client.query(
+      `INSERT INTO transactions
+       (reference_number, type, amount_points, fee_points,
+        sender_user_id, initiated_by, description)
+       VALUES ($1, 'admin_debit', $2, 0, $3, $4, $5)`,
+      [ref, amount, target.id, req.userId, reason || 'خصم إداري']
+    );
+
+    await client.query(
+      `INSERT INTO audit_logs (actor_user_id, action, target_user_id, metadata)
+       VALUES ($1, 'debit', $2, $3)`,
+      [req.userId, target.id, JSON.stringify({ amount, reason })]
+    );
+
+    await client.query('COMMIT');
+
+    const newBalance = Number(target.balance_points) - amount;
+    res.json({
+      success: true,
+      data: {
+        referenceNumber: ref,
+        targetMemberNumber: target.member_number,
+        targetName: target.full_name,
+        amount,
+        newBalance
+      }
+    });
+  } catch (e) {
+    await client.query('ROLLBACK');
+    next(e);
+  } finally {
+    client.release();
+  }
+});
+
+// ---------- الأدمن: إدارة الأعضاء ----------
+app.post('/api/admin/users/:id/suspend', authRequired, adminRequired, async (req, res, next) => {
+  try {
+    const userId = parseInt(req.params.id, 10);
+    if (Number(userId) === Number(req.userId)) {
+      return res.status(400).json({ success: false, code: 'SELF_SUSPEND', message: 'لا يمكنك تجميد حسابك' });
+    }
+    const r = await pool.query(
+      'UPDATE users SET status = $1, updated_at = NOW() WHERE id = $2 RETURNING *',
+      ['suspended', userId]
+    );
+    if (r.rowCount === 0) {
+      return res.status(404).json({ success: false, code: 'USER_NOT_FOUND', message: 'المستخدم غير موجود' });
+    }
+    await pool.query(
+      `INSERT INTO audit_logs (actor_user_id, action, target_user_id) VALUES ($1, 'suspend', $2)`,
+      [req.userId, userId]
+    );
+    res.json({ success: true, data: publicUser(r.rows[0]) });
+  } catch (e) { next(e); }
+});
+
+app.post('/api/admin/users/:id/reactivate', authRequired, adminRequired, async (req, res, next) => {
+  try {
+    const userId = parseInt(req.params.id, 10);
+    const r = await pool.query(
+      'UPDATE users SET status = $1, updated_at = NOW() WHERE id = $2 RETURNING *',
+      ['active', userId]
+    );
+    if (r.rowCount === 0) {
+      return res.status(404).json({ success: false, code: 'USER_NOT_FOUND', message: 'المستخدم غير موجود' });
+    }
+    await pool.query(
+      `INSERT INTO audit_logs (actor_user_id, action, target_user_id) VALUES ($1, 'reactivate', $2)`,
+      [req.userId, userId]
+    );
+    res.json({ success: true, data: publicUser(r.rows[0]) });
+  } catch (e) { next(e); }
+});
+
+app.post('/api/admin/users/:id/delete', authRequired, adminRequired, async (req, res, next) => {
+  try {
+    const userId = parseInt(req.params.id, 10);
+    if (Number(userId) === Number(req.userId)) {
+      return res.status(400).json({ success: false, code: 'SELF_DELETE', message: 'لا يمكنك حذف حسابك' });
+    }
+    const r = await pool.query('DELETE FROM users WHERE id = $1 RETURNING id, username', [userId]);
+    if (r.rowCount === 0) {
+      return res.status(404).json({ success: false, code: 'USER_NOT_FOUND', message: 'المستخدم غير موجود' });
+    }
+    await pool.query(
+      `INSERT INTO audit_logs (actor_user_id, action, target_user_id) VALUES ($1, 'delete', $2)`,
+      [req.userId, userId]
+    );
+    res.json({ success: true, data: { deleted: userId, username: r.rows[0].username } });
+  } catch (e) { next(e); }
+});
+
+app.get('/api/admin/users', authRequired, adminRequired, async (req, res, next) => {
+  try {
+    const q = (req.query.q || '').trim();
+    let r;
+    if (q) {
+      const normalized = normalizeMemberNumber(q);
+      if (normalized) {
+        r = await pool.query(
+          `SELECT * FROM users
+           WHERE member_number = $1 OR username ILIKE $2 OR full_name ILIKE $2
+           ORDER BY id DESC LIMIT 50`,
+          [normalized, '%' + q + '%']
         );
-
-        if (r.rowCount === 0) {
-            return ctx.reply('❌ لا نتائج.', homeKeyboard());
-        }
-
-        const buttons = r.rows.map(u => {
-            const mark = u.is_verified ? '✅' : '⏳';
-            return [Markup.button.callback(
-                `${mark} ${u.full_name} — ${u.member_number}`,
-                `user_view_${u.id}`
-            )];
-        });
-        buttons.push([Markup.button.callback('🏠 الرئيسية', 'main')]);
-
-        return ctx.reply(`🔍 *${r.rowCount} نتائج:*`, { parse_mode: 'Markdown', ...Markup.inlineKeyboard(buttons) });
-    }
-
-    // اختيار مستخدم لعمليات الرصيد
-    if (state.step === 'balance_select_user' && state.balanceAction) {
-        const memberNumber = normalizeMemberNumber(text);
-        if (!memberNumber) return ctx.reply('❌ رقم غير صحيح.');
-
-        const u = (await pool.query('SELECT id, member_number, full_name FROM users WHERE member_number = $1', [memberNumber])).rows[0];
-        if (!u) return ctx.reply('❌ لا يوجد عضو.');
-
-        setState(ctx, { step: 'balance_amount', targetUserId: u.id });
-        return ctx.reply(
-            `💰 العضو: ${escapeMd(u.full_name)}\n\`${u.member_number}\`\n\nأرسل عدد النقاط:`,
-            { parse_mode: 'Markdown', ...homeKeyboard() }
+      } else {
+        r = await pool.query(
+          `SELECT * FROM users
+           WHERE username ILIKE $1 OR member_number ILIKE $1 OR full_name ILIKE $1
+           ORDER BY id DESC LIMIT 50`,
+          ['%' + q + '%']
         );
+      }
+    } else {
+      r = await pool.query('SELECT * FROM users ORDER BY id DESC LIMIT 50');
     }
-
-    // إدخال مبلغ الرصيد
-    if (state.step === 'balance_amount' && state.balanceAction && state.targetUserId) {
-        const amount = parseInt(text.trim(), 10);
-        if (!Number.isInteger(amount) || amount <= 0) {
-            return ctx.reply('❌ المبلغ غير صحيح.');
-        }
-        const action = state.balanceAction;
-        const userId = state.targetUserId;
-        setState(ctx, { step: 'main', balanceAction: null, targetUserId: null });
-        return executeBalanceAction(ctx, action, userId, amount);
-    }
+    res.json({ success: true, data: r.rows.map(publicUser) });
+  } catch (e) { next(e); }
 });
 
-// =====================================
-// معالجة الأخطاء
-// =====================================
+app.get('/api/admin/stats', authRequired, adminRequired, async (req, res, next) => {
+  try {
+    const usersCount = (await pool.query('SELECT COUNT(*) AS c FROM users')).rows[0].c;
+    const verifiedCount = (await pool.query('SELECT COUNT(*) AS c FROM users WHERE is_verified = TRUE')).rows[0].c;
+    const txCount = (await pool.query('SELECT COUNT(*) AS c FROM transactions')).rows[0].c;
+    const totalBalance = (await pool.query('SELECT COALESCE(SUM(balance_points), 0) AS s FROM users')).rows[0].s;
 
-bot.catch((error, ctx) => {
-    console.error('خطأ في البوت:', error.message);
+    res.json({
+      success: true,
+      data: {
+        totalUsers: Number(usersCount),
+        verifiedUsers: Number(verifiedCount),
+        totalTransactions: Number(txCount),
+        totalBalancePoints: Number(totalBalance)
+      }
+    });
+  } catch (e) { next(e); }
 });
 
-// =====================================
-// تشغيل البوت
-// =====================================
-
-bot.launch()
-    .then(() => console.log('🤖 Bot started successfully'))
-    .catch((error) => console.error('فشل التشغيل:', error.message));
-
-process.once('SIGINT', async () => {
-    bot.stop('SIGINT');
-    await pool.end();
+// ---------- معالجات الأخطاء ----------
+app.use((req, res) => {
+  res.status(404).json({ success: false, code: 'NOT_FOUND', message: 'المسار غير موجود' });
 });
-process.once('SIGTERM', async () => {
-    bot.stop('SIGTERM');
-    await pool.end();
+
+app.use((err, req, res, next) => {
+  console.error('❌ Server error:', err.message, err.stack);
+  
+  if (err.code === '23505') {
+    return res.status(409).json({ 
+      success: false, 
+      code: 'DUPLICATE_KEY', 
+      message: 'البيانات موجودة مسبقاً' 
+    });
+  }
+  
+  res.status(500).json({ success: false, code: 'SERVER_ERROR', message: 'حدث خطأ في الخادم' });
 });
+
+// ---------- بدء ----------
+(async () => {
+  try {
+    await initDb();
+    console.log('✅ Database connected');
+    const server = app.listen(PORT, () => {
+      console.log('🚀 NOQAT Server running on port ' + PORT);
+    });
+
+    const shutdown = async (signal) => {
+      console.log(`\n⏹️  ${signal} received. Shutting down...`);
+      server.close(async () => {
+        try { await pool.end(); } catch (_) {}
+        process.exit(0);
+      });
+      setTimeout(() => process.exit(1), 10000);
+    };
+    process.on('SIGTERM', () => shutdown('SIGTERM'));
+    process.on('SIGINT',  () => shutdown('SIGINT'));
+  } catch (e) {
+    console.error('❌ Startup failed:', e.message);
+    process.exit(1);
+  }
+})();

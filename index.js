@@ -471,7 +471,7 @@ bot.action(/^user_delete_confirm_(\d+)$/, async (ctx) => {
 });
 
 // =====================================
-// ✅ التوثيق اليدوي (ينشئ سجل في documents)
+// التوثيق اليدوي / الإلغاء
 // =====================================
 
 bot.action(/^user_verify_(\d+)$/, async (ctx) => {
@@ -494,13 +494,11 @@ bot.action(/^user_verify_(\d+)$/, async (ctx) => {
 
         const target = userR.rows[0];
 
-        // تحديث حالة التوثيق
         await client.query(
             'UPDATE users SET is_verified = TRUE, updated_at = NOW() WHERE id = $1',
             [userId]
         );
 
-        // إنشاء أو تحديث سجل المستند لضمان التكامل
         const existing = await client.query(
             'SELECT id FROM documents WHERE user_id = $1',
             [userId]
@@ -546,15 +544,10 @@ bot.action(/^user_verify_(\d+)$/, async (ctx) => {
     }
 });
 
-// =====================================
-// ✅ إلغاء التوثيق (يحذف سجل المستند)
-// =====================================
-
 bot.action(/^user_unverify_(\d+)$/, async (ctx) => {
     await ctx.answerCbQuery();
     const userId = Number(ctx.match[1]);
 
-    // نطلب تأكيداً لأن هذه العملية مهمة
     await safeEdit(
         ctx,
         `⚠️ *تأكيد إلغاء التوثيق*\n\n` +
@@ -578,17 +571,6 @@ bot.action(/^user_unverify_confirm_(\d+)$/, async (ctx) => {
     try {
         await client.query('BEGIN');
 
-        const userR = await client.query(
-            'SELECT id, username FROM users WHERE id = $1 FOR UPDATE',
-            [userId]
-        );
-
-        if (userR.rowCount === 0) {
-            await client.query('ROLLBACK');
-            return ctx.reply('❌ العضو غير موجود.');
-        }
-
-        // إلغاء التوثيق
         await client.query(
             `UPDATE users 
              SET is_verified = FALSE, 
@@ -599,7 +581,6 @@ bot.action(/^user_unverify_confirm_(\d+)$/, async (ctx) => {
             [userId]
         );
 
-        // حذف سجل المستند ليتمكن من إرسال طلب جديد
         await client.query('DELETE FROM documents WHERE user_id = $1', [userId]);
 
         await client.query(
@@ -622,7 +603,7 @@ bot.action(/^user_unverify_confirm_(\d+)$/, async (ctx) => {
 });
 
 // =====================================
-// إدارة الرصيد - شحن / خصم / إهداء
+// إدارة الرصيد
 // =====================================
 
 bot.action('balance_menu', async (ctx) => {
@@ -769,7 +750,7 @@ async function executeBalanceAction(ctx, action, userId, amount) {
 }
 
 // =====================================
-// الأوامر النصية: gift / credit / debit / find
+// الأوامر النصية
 // =====================================
 
 bot.command('gift', async (ctx) => {
@@ -833,7 +814,7 @@ bot.command('find', async (ctx) => {
 });
 
 // =====================================
-// طلبات التوثيق
+// ✅ طلبات التوثيق (مع التشخيص الكامل للصورة)
 // =====================================
 
 bot.action('pending_docs', async (ctx) => {
@@ -843,7 +824,8 @@ bot.action('pending_docs', async (ctx) => {
         const r = await pool.query(
             `SELECT d.id, d.national_id, d.full_name_4, d.date_of_birth,
                     d.image_data, d.created_at,
-                    u.username, u.member_number, u.full_name, u.id AS user_id
+                    u.username, u.member_number, u.full_name, u.id AS user_id,
+                    LENGTH(d.image_data) AS image_length
              FROM documents d
              JOIN users u ON u.id = d.user_id
              WHERE d.status = 'pending'
@@ -858,6 +840,15 @@ bot.action('pending_docs', async (ctx) => {
         await ctx.reply(`📋 *${r.rowCount} طلب معلق:*`, { parse_mode: 'Markdown' });
 
         for (const doc of r.rows) {
+            // 🔍 تشخيص مفصل
+            console.log('==========================================');
+            console.log(`📄 Document ID: ${doc.id}`);
+            console.log(`👤 User: ${doc.username} (${doc.member_number})`);
+            console.log(`📸 image_data length: ${doc.image_length || 0}`);
+            console.log(`📸 First 60 chars: ${(doc.image_data || '').substring(0, 60)}`);
+
+            const imageSizeKB = doc.image_length ? (doc.image_length / 1024).toFixed(1) : '0';
+            
             const caption =
                 `👤 *الاسم:* ${escapeMd(doc.full_name_4)}\n` +
                 `🆔 *الرقم الوطني:* \`${doc.national_id}\`\n` +
@@ -866,7 +857,8 @@ bot.action('pending_docs', async (ctx) => {
                 `👥 *صاحب الحساب:*\n` +
                 `• @${escapeMd(doc.username)}\n` +
                 `• \`${doc.member_number}\`\n` +
-                `• ID: \`${doc.user_id}\``;
+                `• ID: \`${doc.user_id}\`\n\n` +
+                `🖼️ *حجم الصورة:* ${imageSizeKB} KB`;
 
             const keyboard = Markup.inlineKeyboard([
                 [
@@ -875,28 +867,66 @@ bot.action('pending_docs', async (ctx) => {
                 ]
             ]);
 
-            try {
-                const base64Data = (doc.image_data || '').replace(/^data:image\/\w+;base64,/, '');
-                if (base64Data) {
-                    const imageBuffer = Buffer.from(base64Data, 'base64');
-                    await ctx.replyWithPhoto(
-                        { source: imageBuffer },
-                        { caption, parse_mode: 'Markdown', ...keyboard }
-                    );
-                } else {
-                    await ctx.reply(caption, { parse_mode: 'Markdown', ...keyboard });
+            let photoSent = false;
+
+            // محاولة إرسال الصورة
+            if (doc.image_data && doc.image_length > 100) {
+                try {
+                    // تنظيف Base64 بشكل شامل
+                    let base64Data = doc.image_data
+                        .replace(/^data:image\/\w+;base64,/, '')  // إزالة البادئة
+                        .replace(/\s/g, '')                      // إزالة المسافات والأسطر
+                        .replace(/[^A-Za-z0-9+/=]/g, '');       // إزالة أي أحرف غير Base64
+
+                    console.log(`📸 Cleaned base64 length: ${base64Data.length}`);
+
+                    if (base64Data.length > 100) {
+                        const imageBuffer = Buffer.from(base64Data, 'base64');
+                        
+                        console.log(`📸 Buffer size: ${imageBuffer.length} bytes (${(imageBuffer.length / 1024).toFixed(1)} KB)`);
+
+                        // التحقق من الصيغة (Magic Bytes)
+                        const magicBytes = imageBuffer.slice(0, 4);
+                        const isJPEG = magicBytes[0] === 0xFF && magicBytes[1] === 0xD8;
+                        const isPNG = magicBytes[0] === 0x89 && magicBytes[1] === 0x50;
+                        const isWEBP = imageBuffer.slice(8, 12).toString() === 'WEBP';
+
+                        console.log(`📸 Format: JPEG=${isJPEG}, PNG=${isPNG}, WEBP=${isWEBP}`);
+
+                        if (isJPEG || isPNG || isWEBP) {
+                            await ctx.replyWithPhoto(
+                                { source: imageBuffer },
+                                { caption, parse_mode: 'Markdown', ...keyboard }
+                            );
+                            photoSent = true;
+                            console.log(`✅ Photo sent successfully`);
+                        } else {
+                            console.error(`❌ Invalid image format`);
+                        }
+                    }
+                } catch (err) {
+                    console.error(`❌ Photo send error:`, err.message);
                 }
-            } catch (err) {
+            } else {
+                console.log(`⚠️ Image is empty or too small`);
+            }
+
+            // إذا فشلت الصورة، أرسل النص فقط
+            if (!photoSent) {
                 await ctx.reply(caption, { parse_mode: 'Markdown', ...keyboard });
             }
         }
 
         await ctx.reply('— انتهى —', homeKeyboard());
     } catch (e) {
-        console.error(e.message);
+        console.error('❌ Error:', e.message);
         await ctx.reply('❌ خطأ: ' + e.message);
     }
 });
+
+// =====================================
+// الموافقة والرفض
+// =====================================
 
 bot.action(/^approve_doc_(\d+)$/, async (ctx) => {
     await ctx.answerCbQuery();

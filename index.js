@@ -12,7 +12,6 @@ const JWT_SECRET = process.env.JWT_SECRET || 'dev-secret-change-in-production';
 const JWT_EXPIRES_IN = '7d';
 const TRANSFER_FEE = 5;
 
-// قائمة الأدمن
 const ADMIN_USERNAMES = (process.env.ADMIN_USERNAMES || '')
   .split(',')
   .map(s => s.trim())
@@ -38,7 +37,6 @@ app.disable('x-powered-by');
 app.use(cors());
 app.use(express.json({ limit: '3mb' }));
 
-// منع تسجيل الدخول المتكرر
 const loginAttempts = new Map();
 const MAX_LOGIN_ATTEMPTS = 10;
 const LOGIN_WINDOW_MS = 15 * 60 * 1000;
@@ -78,7 +76,6 @@ async function initDb() {
     await client.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS national_id VARCHAR(20)`);
     await client.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS date_of_birth DATE`);
 
-    // جدول المستندات: قيد UNIQUE على user_id فقط (كل مستخدم له صف واحد)
     await client.query(`
       CREATE TABLE IF NOT EXISTS documents (
         id              BIGSERIAL PRIMARY KEY,
@@ -95,13 +92,13 @@ async function initDb() {
       );
     `);
 
-    // إزالة أي قيود قديمة على national_id
+    // ✅ حذف القيد القديم على national_id (يسمح بتكراره بين المستخدمين)
     await client.query(`
       ALTER TABLE documents 
       DROP CONSTRAINT IF EXISTS documents_national_id_key
     `);
 
-    // التأكد من وجود قيد UNIQUE على user_id
+    // ✅ التأكد من وجود قيد UNIQUE على user_id
     await client.query(`
       DO $$
       BEGIN
@@ -159,16 +156,12 @@ async function initDb() {
     }
 
     console.log('✅ Tables ready');
-    if (ADMIN_USERNAMES.length > 0) {
-      console.log('👑 Admins: ' + ADMIN_USERNAMES.join(', '));
-    }
   } finally {
     client.release();
   }
 }
 
-// ---------- أدوات مساعدة ----------
-
+// ---------- أدوات ----------
 function generateMemberNumber() {
   const n = Math.floor(10000000 + Math.random() * 90000000);
   return `NQ-${n}`;
@@ -218,7 +211,6 @@ function publicUser(row) {
 }
 
 // ---------- Middleware ----------
-
 function authRequired(req, res, next) {
   const header = req.headers.authorization || '';
   const token = header.startsWith('Bearer ') ? header.slice(7) : null;
@@ -245,7 +237,6 @@ async function adminRequired(req, res, next) {
 }
 
 // ---------- الصفحة الرئيسية ----------
-
 app.get('/', async (req, res) => {
   let userCount = 0, txCount = 0, dbStatus = 'unknown';
   try {
@@ -291,7 +282,6 @@ app.get('/health', async (req, res) => {
 });
 
 // ---------- المصادقة ----------
-
 app.post('/api/auth/register', async (req, res, next) => {
   try {
     const { fullName, username, phone, password } = req.body || {};
@@ -374,7 +364,6 @@ app.post('/api/auth/login', async (req, res, next) => {
 });
 
 // ---------- تغيير كلمة المرور ----------
-
 app.post('/api/account/change-password', authRequired, async (req, res, next) => {
   try {
     const { currentPassword, newPassword } = req.body || {};
@@ -386,12 +375,11 @@ app.post('/api/account/change-password', authRequired, async (req, res, next) =>
         message: 'كلمة المرور الحالية والجديدة مطلوبتان' 
       });
     }
-
     if (newPassword.length < 6) {
       return res.status(400).json({ 
         success: false, 
         code: 'WEAK_PASSWORD', 
-        message: 'كلمة المرور الجديدة قصيرة جدًا (6 أحرف على الأقل)' 
+        message: 'كلمة المرور الجديدة قصيرة جدًا' 
       });
     }
 
@@ -402,11 +390,7 @@ app.post('/api/account/change-password', authRequired, async (req, res, next) =>
 
     const ok = await bcrypt.compare(currentPassword, userR.rows[0].password_hash);
     if (!ok) {
-      return res.status(401).json({ 
-        success: false, 
-        code: 'INVALID_PASSWORD', 
-        message: 'كلمة المرور الحالية غير صحيحة' 
-      });
+      return res.status(401).json({ success: false, code: 'INVALID_PASSWORD', message: 'كلمة المرور الحالية غير صحيحة' });
     }
 
     const newHash = await bcrypt.hash(newPassword, 10);
@@ -426,7 +410,6 @@ app.post('/api/account/change-password', authRequired, async (req, res, next) =>
 });
 
 // ---------- الحساب ----------
-
 app.get('/api/account/me', authRequired, async (req, res, next) => {
   try {
     const r = await pool.query('SELECT * FROM users WHERE id = $1', [req.userId]);
@@ -448,7 +431,6 @@ app.get('/api/account/balance', authRequired, async (req, res, next) => {
 });
 
 // ---------- البحث عن مستخدم ----------
-
 app.get('/api/users/lookup', authRequired, async (req, res, next) => {
   try {
     const raw = req.query.memberNumber;
@@ -478,7 +460,6 @@ app.get('/api/users/lookup', authRequired, async (req, res, next) => {
 });
 
 // ---------- معاينة التحويل ----------
-
 app.post('/api/transfers/preview', authRequired, async (req, res, next) => {
   try {
     const { receiverMemberNumber, amountPoints } = req.body || {};
@@ -489,7 +470,7 @@ app.post('/api/transfers/preview', authRequired, async (req, res, next) => {
       return res.status(400).json({ success: false, code: 'INVALID_MEMBER_NUMBER', message: 'رقم العضوية غير صالح' });
     }
     if (!amount) {
-      return res.status(400).json({ success: false, code: 'INVALID_AMOUNT', message: 'المبلغ يجب أن يكون عددًا صحيحًا أكبر من صفر' });
+      return res.status(400).json({ success: false, code: 'INVALID_AMOUNT', message: 'المبلغ غير صحيح' });
     }
 
     const senderR = await pool.query('SELECT * FROM users WHERE id = $1', [req.userId]);
@@ -533,7 +514,6 @@ app.post('/api/transfers/preview', authRequired, async (req, res, next) => {
 });
 
 // ---------- التحويلات ----------
-
 app.post('/api/transfers', authRequired, async (req, res, next) => {
   const { receiverMemberNumber, amountPoints, note, idempotencyKey } = req.body || {};
 
@@ -544,10 +524,7 @@ app.post('/api/transfers', authRequired, async (req, res, next) => {
     return res.status(400).json({ success: false, code: 'INVALID_MEMBER_NUMBER', message: 'رقم العضوية غير صالح' });
   }
   if (!amount) {
-    return res.status(400).json({ success: false, code: 'INVALID_AMOUNT', message: 'المبلغ يجب أن يكون عددًا صحيحًا أكبر من صفر' });
-  }
-  if (idempotencyKey && String(idempotencyKey).length > 64) {
-    return res.status(400).json({ success: false, code: 'INVALID_IDEMPOTENCY', message: 'مفتاح منع التكرار طويل جدًا' });
+    return res.status(400).json({ success: false, code: 'INVALID_AMOUNT', message: 'المبلغ غير صحيح' });
   }
 
   const client = await pool.connect();
@@ -568,7 +545,6 @@ app.post('/api/transfers', authRequired, async (req, res, next) => {
       await client.query('ROLLBACK');
       return res.status(403).json({ success: false, code: 'NOT_VERIFIED', message: 'يجب توثيق حسابك قبل التحويل' });
     }
-
     if (sender.status !== 'active') {
       await client.query('ROLLBACK');
       return res.status(403).json({ success: false, code: 'ACCOUNT_NOT_ACTIVE', message: 'حسابك غير نشط' });
@@ -625,7 +601,7 @@ app.post('/api/transfers', authRequired, async (req, res, next) => {
       return res.status(400).json({
         success: false,
         code: 'INSUFFICIENT_BALANCE',
-        message: `رصيدك غير كافٍ. المطلوب: ${total} (${amount} + ${TRANSFER_FEE} رسوم)`
+        message: `رصيدك غير كافٍ. المطلوب: ${total}`
       });
     }
 
@@ -671,7 +647,6 @@ app.post('/api/transfers', authRequired, async (req, res, next) => {
 });
 
 // ---------- سجل العمليات ----------
-
 app.get('/api/transactions', authRequired, async (req, res, next) => {
   try {
     const limit = Math.min(parseInt(req.query.limit, 10) || 20, 100);
@@ -741,7 +716,7 @@ app.get('/api/transactions/:id', authRequired, async (req, res, next) => {
 // مسارات التوثيق
 // ==========================================
 
-// رفع مستند التوثيق
+// ✅ رفع مستند التوثيق - يسمح لكل مستخدم بإرسال طلب واحد فقط
 app.post('/api/documents/upload', authRequired, async (req, res, next) => {
   const { nationalId, fullName4, dateOfBirth, imageBase64 } = req.body || {};
 
@@ -749,7 +724,7 @@ app.post('/api/documents/upload', authRequired, async (req, res, next) => {
     return res.status(400).json({ 
       success: false, 
       code: 'MISSING_FIELDS', 
-      message: 'جميع الحقول مطلوبة (الرقم الوطني، الاسم، تاريخ الميلاد، الصورة)' 
+      message: 'جميع الحقول مطلوبة' 
     });
   }
 
@@ -794,20 +769,35 @@ app.post('/api/documents/upload', authRequired, async (req, res, next) => {
       return res.status(400).json({ 
         success: false, 
         code: 'ALREADY_VERIFIED', 
-        message: 'حسابك موثق بالفعل. لا يمكنك إرسال طلب جديد.' 
+        message: 'حسابك موثق بالفعل. تواصل مع الإدارة إذا كنت بحاجة لإلغاء التوثيق.' 
       });
     }
 
-    // 2. ابحث عن أي طلب سابق لهذا المستخدم
+    // 2. تحقق من تضارب الرقم الوطني مع مستخدم آخر
+    const conflict = await client.query(
+      `SELECT u.id, u.username 
+       FROM users u 
+       WHERE u.national_id = $1 AND u.id != $2 AND u.is_verified = TRUE`,
+      [cleanId, req.userId]
+    );
+
+    if (conflict.rowCount > 0) {
+      await client.query('ROLLBACK');
+      return res.status(409).json({ 
+        success: false, 
+        code: 'NATIONAL_ID_TAKEN', 
+        message: 'هذا الرقم الوطني مرتبط بحساب موثق آخر' 
+      });
+    }
+
+    // 3. ابحث عن أي طلب سابق لهذا المستخدم
     const existing = await client.query(
       'SELECT id, status FROM documents WHERE user_id = $1 FOR UPDATE',
       [req.userId]
     );
 
     if (existing.rowCount > 0) {
-      // المستخدم لديه طلب سابق (pending أو rejected) → نحدّثه
-      const doc = existing.rows[0];
-      
+      // تحديث الطلب القديم
       await client.query(
         `UPDATE documents 
          SET national_id = $1, 
@@ -820,10 +810,10 @@ app.post('/api/documents/upload', authRequired, async (req, res, next) => {
              reviewed_by = NULL,
              created_at = NOW()
          WHERE id = $5`,
-        [cleanId, fullName4, dateOfBirth, imageBase64, doc.id]
+        [cleanId, fullName4, dateOfBirth, imageBase64, existing.rows[0].id]
       );
     } else {
-      // أول طلب للمستخدم
+      // طلب جديد
       await client.query(
         `INSERT INTO documents (user_id, national_id, full_name_4, date_of_birth, image_data, status)
          VALUES ($1, $2, $3, $4, $5, 'pending')`,
@@ -852,7 +842,7 @@ app.post('/api/documents/upload', authRequired, async (req, res, next) => {
   }
 });
 
-// جلب حالة التوثيق للمستخدم الحالي
+// جلب حالة التوثيق
 app.get('/api/documents/status', authRequired, async (req, res, next) => {
   try {
     const r = await pool.query(
@@ -879,10 +869,9 @@ app.get('/api/documents/status', authRequired, async (req, res, next) => {
 });
 
 // ==========================================
-// مسارات الأدمن - التوثيق
+// مسارات الأدمن
 // ==========================================
 
-// عرض الطلبات المعلقة
 app.get('/api/admin/documents/pending', authRequired, adminRequired, async (req, res, next) => {
   try {
     const r = await pool.query(
@@ -899,7 +888,6 @@ app.get('/api/admin/documents/pending', authRequired, adminRequired, async (req,
   }
 });
 
-// قبول التوثيق
 app.post('/api/admin/documents/:id/approve', authRequired, adminRequired, async (req, res, next) => {
   const docId = parseInt(req.params.id, 10);
   if (!Number.isFinite(docId)) {
@@ -951,7 +939,6 @@ app.post('/api/admin/documents/:id/approve', authRequired, adminRequired, async 
   }
 });
 
-// رفض التوثيق
 app.post('/api/admin/documents/:id/reject', authRequired, adminRequired, async (req, res, next) => {
   const docId = parseInt(req.params.id, 10);
   const { reason } = req.body || {};
@@ -1006,7 +993,7 @@ app.post('/api/admin/documents/:id/reject', authRequired, adminRequired, async (
   }
 });
 
-// ✅ إلغاء توثيق مستخدم (من الإدارة) - يسمح له بإرسال طلب جديد
+// ✅✅✅ إلغاء توثيق مستخدم (للأدمن) - يحذف السجل ليتمكن من إعادة الإرسال
 app.post('/api/admin/users/:id/unverify', authRequired, adminRequired, async (req, res, next) => {
   const userId = parseInt(req.params.id, 10);
   if (!Number.isFinite(userId)) {
@@ -1029,7 +1016,12 @@ app.post('/api/admin/users/:id/unverify', authRequired, adminRequired, async (re
 
     // إلغاء التوثيق
     await client.query(
-      'UPDATE users SET is_verified = FALSE, national_id = NULL, date_of_birth = NULL, updated_at = NOW() WHERE id = $1',
+      `UPDATE users 
+       SET is_verified = FALSE, 
+           national_id = NULL, 
+           date_of_birth = NULL, 
+           updated_at = NOW() 
+       WHERE id = $1`,
       [userId]
     );
 
@@ -1058,14 +1050,13 @@ app.post('/api/admin/users/:id/unverify', authRequired, adminRequired, async (re
 });
 
 // ---------- الأدمن: الشحن والخصم ----------
-
 app.post('/api/admin/credit', authRequired, adminRequired, async (req, res, next) => {
   const { memberNumber, amountPoints, reason } = req.body || {};
   const normalized = normalizeMemberNumber(memberNumber);
   const amount = parsePositiveInt(amountPoints);
 
   if (!normalized || !amount) {
-    return res.status(400).json({ success: false, code: 'INVALID_INPUT', message: 'رقم العضوية والمبلغ الصحيح مطلوبان' });
+    return res.status(400).json({ success: false, code: 'INVALID_INPUT', message: 'رقم العضوية والمبلغ مطلوبان' });
   }
 
   const client = await pool.connect();
@@ -1129,7 +1120,7 @@ app.post('/api/admin/debit', authRequired, adminRequired, async (req, res, next)
   const amount = parsePositiveInt(amountPoints);
 
   if (!normalized || !amount) {
-    return res.status(400).json({ success: false, code: 'INVALID_INPUT', message: 'رقم العضوية والمبلغ الصحيح مطلوبان' });
+    return res.status(400).json({ success: false, code: 'INVALID_INPUT', message: 'رقم العضوية والمبلغ مطلوبان' });
   }
 
   const client = await pool.connect();
@@ -1197,7 +1188,6 @@ app.post('/api/admin/debit', authRequired, adminRequired, async (req, res, next)
 });
 
 // ---------- الأدمن: إدارة الأعضاء ----------
-
 app.post('/api/admin/users/:id/suspend', authRequired, adminRequired, async (req, res, next) => {
   try {
     const userId = parseInt(req.params.id, 10);
@@ -1303,7 +1293,6 @@ app.get('/api/admin/stats', authRequired, adminRequired, async (req, res, next) 
 });
 
 // ---------- معالجات الأخطاء ----------
-
 app.use((req, res) => {
   res.status(404).json({ success: false, code: 'NOT_FOUND', message: 'المسار غير موجود' });
 });
@@ -1311,7 +1300,6 @@ app.use((req, res) => {
 app.use((err, req, res, next) => {
   console.error('❌ Server error:', err.message, err.stack);
   
-  // معالجة خطأ تكرار المفتاح
   if (err.code === '23505') {
     return res.status(409).json({ 
       success: false, 
@@ -1324,7 +1312,6 @@ app.use((err, req, res, next) => {
 });
 
 // ---------- بدء ----------
-
 (async () => {
   try {
     await initDb();

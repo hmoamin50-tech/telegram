@@ -2,8 +2,8 @@ require('dotenv').config();
 const { Pool } = require('pg');
 
 // ---------- الإعدادات ----------
-const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const ADMIN_TG_IDS = (process.env.ADMIN_TG_IDS || '')
+const TELEGRAM_BOT_TOKEN = process.env.BOT_TOKEN;
+const ADMIN_TG_IDS = (process.env.ADMIN_TG_ID || '')
   .split(',')
   .map(s => s.trim())
   .filter(Boolean);

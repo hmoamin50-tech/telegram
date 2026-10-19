@@ -3,7 +3,7 @@ const { Pool } = require('pg');
 
 // ---------- الإعدادات ----------
 const TELEGRAM_BOT_TOKEN = process.env.BOT_TOKEN;
-const ADMIN_TG_IDS = (process.env.ADMIN_TG_ID || '')
+const ADMIN_TG_IDS = (process.env.ADMIN_ID || '')
   .split(',')
   .map(s => s.trim())
   .filter(Boolean);

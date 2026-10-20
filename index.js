@@ -1,15 +1,27 @@
 require('dotenv').config();
 const { Pool } = require('pg');
+const http = require('http');
+
+// منفذ مفتوح ليقبله Render ويستطيع UptimeRobot زيارته
+http.createServer((req, res) => res.end('ok'))
+  .listen(process.env.PORT || 3000, () => console.log('🌐 Keep-alive server up'));
 
 // ---------- الإعدادات ----------
-const TELEGRAM_BOT_TOKEN = process.env.BOT_TOKEN;
-const ADMIN_TG_IDS = (process.env.ADMIN_ID || '')
+const env = (...names) => {
+  for (const n of names) if (process.env[n]) return process.env[n];
+  return '';
+};
+
+// يقبل عدة أسماء شائعة للمتغيرات حتى يطابق ما هو مضبوط عندك في Render
+const BOT_TOKEN = env('BOT_TOKEN', 'TELEGRAM_BOT_TOKEN', 'TELEGRAM_TOKEN', 'TOKEN');
+const DB_URL = env('DATABASE_URL', 'SUPABASE_DB_URL', 'DB_URL');
+const ADMIN_TG_IDS = env('ADMIN_TG_IDS', 'ADMIN_IDS', 'ADMIN_CHAT_ID', 'TELEGRAM_CHAT_ID', 'ADMIN_TELEGRAM_ID', 'CHAT_ID')
   .split(',')
   .map(s => s.trim())
   .filter(Boolean);
 
 if (!BOT_TOKEN) {
-  console.error('❌ TELEGRAM_BOT_TOKEN مفقود');
+  console.error('❌ توكن البوت مفقود (BOT_TOKEN أو TELEGRAM_BOT_TOKEN)');
   process.exit(1);
 }
 if (ADMIN_TG_IDS.length === 0) {
@@ -19,8 +31,8 @@ if (ADMIN_TG_IDS.length === 0) {
 const API = `https://api.telegram.org/bot${BOT_TOKEN}`;
 
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: process.env.DATABASE_URL && process.env.DATABASE_URL.includes('supabase')
+  connectionString: DB_URL,
+  ssl: DB_URL && DB_URL.includes('supabase')
     ? { rejectUnauthorized: false }
     : false,
   max: 3,
